@@ -1,0 +1,17 @@
+# Local runtime state and diagnostics
+outputs/
+work/
+*.log
+*.pid
+*.state.json
+
+# Per-machine configuration and secrets
+config.json
+*.local.json
+.env
+
+# Windows/editor noise
+Thumbs.db
+Desktop.ini
+.vs/
+.vscode/

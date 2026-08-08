@@ -1,0 +1,18 @@
+{
+  "TaskName": "Tarkov-CIS-RouteKeeper",
+  "VpnInterfaceAlias": "VPN - VPN Client",
+  "RefreshSeconds": 30,
+  "GameLogRoots": [
+    "C:\\Games\\EscapeFromTarkov\\Logs"
+  ],
+  "TargetHosts": [
+    "gw-pvp.escapefromtarkov.ru",
+    "gw-pvp.escapefromtarkov.com",
+    "gw-pvp-season.escapefromtarkov.ru",
+    "lobby.escapefromtarkov.ru",
+    "wsn-pvp-season-01.escapefromtarkov.com",
+    "wsn-pvp-season-02.escapefromtarkov.com"
+  ],
+  "RaidTargets": []
+}
+
