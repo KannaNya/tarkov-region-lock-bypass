@@ -1,6 +1,8 @@
-# Tarkov CIS split route (Windows / PowerShell)
+# Tarkov Region Lock Bypass (Windows / PowerShell)
 
-这是一个不依赖 Python 的 Windows PowerShell 工具，用 SoftEther VPN Gate 只承载已验证的 Tarkov CIS/地区鉴权和游戏后端域名；普通日本公网和独立 Raid 服务器继续走日本物理网卡。
+建议 GitHub 仓库名：`tarkov-region-lock-bypass`
+
+这是一个不依赖 Python 的 Windows PowerShell 工具，用 SoftEther VPN Gate 只承载已验证的 Tarkov 区域验证和游戏后端域名；普通日本公网和独立 Raid 服务器继续走日本物理网卡。
 
 This project intentionally uses Windows routing and DNS observations from the local machine. It does not ship a fixed “Tarkov IP list”. The keeper resolves configured domains repeatedly and can discover lobby/WSN hostnames from recent EFT backend logs.
 
@@ -64,4 +66,3 @@ Use `Status` to inspect observed hosts, selected interfaces, default route metri
 ## Project status
 
 The core flow has been tested on Windows with SoftEther VPN Gate: launcher region authorization, second profile authorization, Japanese ordinary egress, and known Raid target selection. DNS/CDN layouts can change; contributions should include fresh local evidence and avoid publishing stale IP ranges.
-

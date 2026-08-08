@@ -1,4 +1,4 @@
-# Network model
+# Region-lock bypass network model
 
 The keeper operates at the IPv4 destination-route layer:
 
@@ -20,4 +20,3 @@ curl.exe -4 https://ifconfig.co/country-iso
 ```
 
 For Raid, capture the current game process connections and compare them with the route selected by `Find-NetRoute`; do not paste an old server list into a permanent configuration.
-
