@@ -39,14 +39,22 @@ function Test-TcpQuick {
 }
 
 function Get-CisServers {
-    $lines = (Invoke-WebRequest -UseBasicParsing 'https://www.vpngate.net/api/iphone/').Content -split "`r?`n"
+    # Add a cache-buster: the public list is a live snapshot and intermediary
+    # caches can otherwise return an older country inventory.
+    $apiUri = 'https://www.vpngate.net/api/iphone/?t=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $lines = (Invoke-WebRequest -UseBasicParsing -Uri $apiUri -Headers @{
+        'User-Agent' = 'Tarkov-CIS-RouteKeeper/1.0'
+        'Cache-Control' = 'no-cache'
+    }).Content -split "`r?`n"
     $headerLine = '#HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64'
     $headerIndex = [Array]::IndexOf($lines, $headerLine)
     if ($headerIndex -lt 0) { throw 'VPN Gate CSV header was not found.' }
     $header = $headerLine.TrimStart('#') -split ','
     $rows = $lines[($headerIndex + 1)..($lines.Length - 1)] |
         Where-Object { $_ -and $_ -notmatch '^\*' } | ConvertFrom-Csv -Header $header
-    $priority = @{ RU = 100; KZ = 90; BY = 85; AM = 80; AZ = 75; GE = 70; MD = 65; KG = 60; TJ = 55; TM = 50; UZ = 45 }
+    # UA is included because it is present in VPN Gate's live CIS-compatible
+    # list (and is a requested fallback in the user's deployment).
+    $priority = @{ RU = 100; UA = 95; KZ = 90; BY = 85; AM = 80; AZ = 75; GE = 70; MD = 65; KG = 60; TJ = 55; TM = 50; UZ = 45 }
     $codes = @($priority.Keys)
     $candidates = @($rows | Where-Object CountryShort -in $codes | ForEach-Object {
         $port = 443
@@ -123,4 +131,3 @@ foreach ($server in $reachable) {
 
 Disconnect-VpnAccount
 throw 'Reachable CIS relays were tried, but none produced a usable VPN IPv4 lease.'
-

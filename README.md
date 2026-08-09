@@ -48,7 +48,7 @@ To select a CIS relay automatically, with Russia preferred and other CIS countri
 .\src\Connect-VpnGateCis.ps1 -Action Connect
 ```
 
-The connector reads VPN Gate's live CSV, extracts each relay's published TCP endpoint, tests a small sample per CIS country, and never reports success without a usable VPN IPv4 lease. If VPN Gate currently publishes no reachable CIS relay, it exits with an error and leaves no false connected state.
+The connector queries VPN Gate's live CSV endpoint (`https://www.vpngate.net/api/iphone/`) with a cache-busting timestamp, extracts each relay's published TCP endpoint, and tests a small sample per fallback country. Russia (`RU`) is preferred, followed by Ukraine (`UA`) and the other configured CIS-compatible fallback codes. It never reports success without a usable VPN IPv4 lease. If VPN Gate currently publishes no reachable relay, it exits with an error and leaves no false connected state.
 
 ## Management
 
