@@ -9,6 +9,7 @@ This project intentionally uses Windows routing and DNS observations from the lo
 ## What it does
 
 - Works with an already-connected SoftEther VPN Gate virtual adapter.
+- The bundled connector can prefer Russia and automatically fall back to other CIS countries when the current relay is offline.
 - Maintains only current IPv4 `/32` routes for configured Tarkov backend hosts.
 - Keeps the VPN default route at a high metric so ordinary traffic stays on the physical/Japan adapter.
 - Removes its own routes when the VPN disconnects.
@@ -40,6 +41,14 @@ Set-ExecutionPolicy -Scope Process Bypass
 ```
 
 Connect SoftEther/VPN Gate before launching the game. The task keeps the selected backend routes while the VPN is connected. The ordinary default route remains on the Japanese adapter.
+
+To select a CIS relay automatically, with Russia preferred and other CIS countries as fallback:
+
+```powershell
+.\src\Connect-VpnGateCis.ps1 -Action Connect
+```
+
+The connector reads VPN Gate's live CSV, extracts each relay's published TCP endpoint, tests a small sample per CIS country, and never reports success without a usable VPN IPv4 lease. If VPN Gate currently publishes no reachable CIS relay, it exits with an error and leaves no false connected state.
 
 ## Management
 
