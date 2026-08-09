@@ -11,6 +11,9 @@ $statePath = Join-Path $scriptRoot 'Tarkov-CisRouteKeeper.state.json'
 $pidPath = Join-Path $scriptRoot 'Tarkov-CisRouteKeeper.pid'
 $logPath = Join-Path $scriptRoot 'Tarkov-CisRouteKeeper.log'
 $defaultTaskName = 'Tarkov-CIS-RouteKeeper'
+$connectorPath = Join-Path $scriptRoot 'Connect-VpnGateCis.ps1'
+$vpnCmdPath = 'C:\Program Files\SoftEther VPN Client\vpncmd_x64.exe'
+$vpnAccountName = 'Tarkov-CIS-PlayOnly'
 $defaultHosts = @(
     'gw-pvp.escapefromtarkov.ru',
     'gw-pvp.escapefromtarkov.com',
@@ -61,6 +64,12 @@ function Get-VpnInfo {
     $gateway = $ipConfig.IPv4DefaultGateway.NextHop | Select-Object -First 1
     if (-not $ip -or -not $gateway) { return $null }
     [pscustomobject]@{ InterfaceIndex = [int]$adapter.ifIndex; Alias = $adapter.InterfaceAlias; IPv4 = $ip; Gateway = $gateway }
+}
+
+function Test-SoftEtherSession {
+    if (-not (Test-Path -LiteralPath $vpnCmdPath)) { return $false }
+    & $vpnCmdPath /CLIENT localhost /CMD AccountStatusGet $vpnAccountName 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
 }
 
 function Get-ObservedHosts {
@@ -224,12 +233,22 @@ $mutex = [Threading.Mutex]::new($true, 'Global\Tarkov-CisRouteKeeper', [ref]$cre
 if (-not $created) { exit 0 }
 Set-Content -LiteralPath $pidPath -Value $PID -Encoding ascii
 Write-Log "Keeper started as PID $PID."
+$lastConnectAttempt = [datetime]::MinValue
 try {
     while ($true) {
         try {
             $vpn = Get-VpnInfo
+            if ($vpn -and -not (Test-SoftEtherSession)) {
+                Write-Log 'SoftEther session is no longer established; entering relay failover.'
+                $vpn = $null
+            }
             if (-not $vpn) {
                 if (Test-Path -LiteralPath $statePath) { Remove-StateRoutes; Write-Log 'VPN disconnected; managed routes removed.' }
+                if ((Get-Date) - $lastConnectAttempt -gt [TimeSpan]::FromMinutes(5) -and (Test-Path -LiteralPath $connectorPath)) {
+                    $lastConnectAttempt = Get-Date
+                    Write-Log 'VPN unavailable; refreshing VPN Gate and trying the next CIS relay candidate.'
+                    & $connectorPath -Action Connect 2>&1 | Out-String | ForEach-Object { Write-Log $_.Trim() }
+                }
             } else {
                 Sync-Routes -Vpn $vpn -Targets (Resolve-Targets)
             }
