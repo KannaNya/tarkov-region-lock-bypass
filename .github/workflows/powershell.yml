@@ -12,4 +12,6 @@ jobs:
       - name: Check PowerShell scripts
         shell: pwsh
         run: ./tests/syntax-check.ps1
-
+      - name: Check Windows PowerShell 5.1 compatibility
+        shell: powershell
+        run: .\tests\syntax-check.ps1

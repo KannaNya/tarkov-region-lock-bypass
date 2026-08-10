@@ -77,7 +77,17 @@ function Get-CisServers {
 }
 
 if ($Action -eq 'Status') {
-    try { Invoke-VpnCmd AccountStatusGet $AccountName } catch { Write-Host "Account is offline or not configured: $AccountName" }
+    $statusOutput = @(& $VpnCmdPath /CLIENT localhost /CMD AccountStatusGet $AccountName 2>&1)
+    $statusExitCode = $LASTEXITCODE
+    if ($statusExitCode -eq 0) {
+        $statusOutput |
+            Where-Object {
+                [string]$_ -notmatch '(Session Key|Session Name|Connection Name|SID-VPN-|CID-|\b[0-9A-F]{40}\b)'
+            } |
+            ForEach-Object { Write-Host $_ }
+    } else {
+        Write-Host "Account is offline or not configured: $AccountName"
+    }
     Get-NetAdapter -Name $InterfaceAlias -ErrorAction SilentlyContinue |
         Format-Table ifIndex, Name, Status, MacAddress, LinkSpeed -AutoSize
     exit 0
