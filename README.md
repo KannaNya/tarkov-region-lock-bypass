@@ -1,77 +1,110 @@
-# Tarkov Region Lock Bypass (Windows / PowerShell)
+# Tarkov 区域锁分流与 VPN Gate 自动故障转移
 
-建议 GitHub 仓库名：`tarkov-region-lock-bypass`
+这是一个面向 Windows 的 PowerShell 工具，用于帮助在日本网络环境中使用 CIS 区账号的 Escape from Tarkov 玩家，建立“最小化分流”连接：只把已观察到的登录、区域鉴权和相关后端目标送入 SoftEther VPN Gate 的 CIS 出口，普通日本网络、更新下载以及独立 Raid 服务器继续走日本本地网络。
 
-这是一个不依赖 Python 的 Windows PowerShell 工具，用 SoftEther VPN Gate 只承载已验证的 Tarkov 区域验证和游戏后端域名；普通日本公网和独立 Raid 服务器继续走日本物理网卡。
+项目不依赖 Python，也不使用网上流传的固定 Tarkov IP 清单。它会定期重新解析目标域名，并从近期 EFT 日志中发现 lobby/WSN 主机名；VPN Gate 中继失效时，会重新查询官方实时列表，自动测试并切换到下一个可用的 CIS 候选节点。
 
-This project intentionally uses Windows routing and DNS observations from the local machine. It does not ship a fixed “Tarkov IP list”. The keeper resolves configured domains repeatedly and can discover lobby/WSN hostnames from recent EFT backend logs.
+## 适合哪些人
 
-## What it does
+- 在日本使用 CIS 区账号、遇到登录或地区验证失败的 EFT 玩家。
+- 已安装 SoftEther VPN Client，并愿意使用 VPN Gate 公共中继的人。
+- 希望只代理鉴权/后端目标，不想让整个游戏和普通上网流量走 VPN 的人。
+- 想要后台常驻、节点下线后自动寻找下一个 CIS 节点的人。
+- 能在 Windows 管理员 PowerShell 中执行少量安装和状态命令的用户。
 
-- Works with an already-connected SoftEther VPN Gate virtual adapter.
-- The bundled connector can prefer Russia and automatically fall back to other CIS countries when the current relay is offline.
-- Maintains only current IPv4 `/32` routes for configured Tarkov backend hosts.
-- Keeps the VPN default route at a high metric so ordinary traffic stays on the physical/Japan adapter.
-- Removes its own routes when the VPN disconnects.
-- Detects a changed VPN interface/gateway and removes the previous generation of routes before adding new ones.
-- Installs as a hidden per-user scheduled task; no Python runtime is required.
+## 不适合哪些情况
 
-## Important limitation
+- 需要全局 VPN 加速、降低 Raid 延迟或隐藏全部公网流量的人。
+- 没有 SoftEther VPN Client 或不接受公共 VPN 中继波动的人。
+- 期待项目保证绕过 BSG 账号限制、地区政策或封禁机制的人。本项目不提供这种保证，请遵守游戏和 VPN 服务条款。
 
-Windows routes select by destination IP, not URL path or process. If Tarkov authentication, lobby, matching HTTPS, or other APIs share an IP/CDN address, they cannot be split from one another with ordinary static routes. Independent Raid server IPs/UDP are not added by this project, but you should verify the current session from local logs rather than trust an old list.
+## 工作方式
 
-This project does not bypass account restrictions or guarantee that a VPN exit is accepted by Battlestate Games. Use an account and VPN service in accordance with their terms.
+1. `Connect-VpnGateCis.ps1` 查询 VPN Gate 官方实时 CSV，按 `RU → UA → 其他配置中的 CIS 候选` 排序。
+2. 对候选节点提取官方公布的 TCP 端口并进行快速连通性测试。
+3. 将第一个可用节点写入 SoftEther 账户 `Tarkov-CIS-PlayOnly` 并建立连接。
+4. 常驻任务同时检查网卡、IPv4 地址和 `vpncmd AccountStatusGet` 会话状态。
+5. 当前节点失效时，删除本工具管理的旧路由，重新拉取列表并尝试下一个节点；没有可用节点时最多每 5 分钟重试一次。
+6. 目标域名解析出的地址使用临时 `/32` 路由走 VPN；VPN 默认路由提高 metric，因此日本物理网卡仍是普通流量的默认出口。
 
-## Requirements
+Windows 路由按目标 IP 选择，不能按 URL 路径或进程区分流量。如果登录、匹配或其他 HTTPS 服务共享同一个 CDN/IP，它们无法用普通静态路由进一步拆分。独立 Raid 服务器不会因为本项目的已知目标列表而被加入 VPN，但仍应结合本机日志复核实际服务器。
 
-- Windows 10/11 with elevated PowerShell for installation.
-- SoftEther VPN Client and a connected VPN Gate virtual adapter.
-- PowerShell 5.1+; PowerShell 7 is recommended but not required.
-- Optional: local EFT log directory in `config.json` for dynamic WSN discovery.
+## 环境要求
 
-## Quick start
+- Windows 10/11。
+- SoftEther VPN Client，且已创建并启用 `VPN - VPN Client` 虚拟网卡。
+- PowerShell 5.1 以上；PowerShell 7 推荐但不是强制要求。
+- 管理员 PowerShell（安装任务和写入临时路由需要）。
+- 可选：EFT 本地日志目录，用于动态发现 lobby/WSN 主机名。
+
+## 快速开始
+
+在项目目录中打开“管理员 PowerShell”：
 
 ```powershell
 Copy-Item .\config.example.json .\config.json
-# Edit config.json: set GameLogRoots to your actual EscapeFromTarkov\Logs directory.
+# 编辑 config.json，把 GameLogRoots 改成实际的 EscapeFromTarkov\Logs 路径
+notepad .\config.json
 
 Set-ExecutionPolicy -Scope Process Bypass
+
+# 首次手动建立一个可用的 CIS VPN Gate 连接
+.\src\Connect-VpnGateCis.ps1 -Action Connect
+
+# 安装并启动后台常驻任务
 .\src\Tarkov-CisRouteKeeper.ps1 -Action Install -ConfigPath .\config.json
+
+# 查看任务、VPN、目标域名和选中路由
 .\src\Tarkov-CisRouteKeeper.ps1 -Action Status -ConfigPath .\config.json
 ```
 
-Connect SoftEther/VPN Gate before launching the game. The task keeps the selected backend routes while the VPN is connected. The ordinary default route remains on the Japanese adapter.
+首次连接时，脚本会优先尝试俄罗斯节点；如果俄罗斯节点没有响应，就会继续尝试乌克兰及其他配置中的 CIS 节点。安装常驻任务后，即使当前 VPN 断开，任务也会自动执行同样的故障转移流程，不需要每次手动加入服务器。
 
-To select a CIS relay automatically, with Russia preferred and other CIS countries as fallback:
+## 日常管理
 
 ```powershell
+# 手动刷新节点并连接当前最优候选
 .\src\Connect-VpnGateCis.ps1 -Action Connect
-```
 
-The connector queries VPN Gate's live CSV endpoint (`https://www.vpngate.net/api/iphone/`) with a cache-busting timestamp, extracts each relay's published TCP endpoint, and tests a small sample per fallback country. Russia (`RU`) is preferred, followed by Ukraine (`UA`) and the other configured CIS-compatible fallback codes. It never reports success without a usable VPN IPv4 lease. If VPN Gate currently publishes no reachable relay, it exits with an error and leaves no false connected state.
+# 查看 SoftEther 账户和网卡状态
+.\src\Connect-VpnGateCis.ps1 -Action Status
 
-## Management
-
-```powershell
-# Stop the worker and remove only routes owned by it
+# 停止后台任务，并删除本工具创建的临时路由
 .\src\Tarkov-CisRouteKeeper.ps1 -Action Stop -ConfigPath .\config.json
 
-# Start the already-installed task again
+# 重新启动已经安装的任务
 Start-ScheduledTask -TaskName Tarkov-CIS-RouteKeeper
 
-# Remove the scheduled task and owned routes
+# 卸载任务，并删除本工具创建的临时路由
 .\src\Tarkov-CisRouteKeeper.ps1 -Action Uninstall -ConfigPath .\config.json
 ```
 
-Use `Status` to inspect observed hosts, selected interfaces, default route metrics, and configured Raid safety targets.
+常驻任务名称为 `Tarkov-CIS-RouteKeeper`。日志、状态文件和本地配置默认不应提交到 Git；仓库的 `.gitignore` 已排除这些运行时内容。
 
-## Safety and privacy
+## 如何确认分流正确
 
-- Never commit `config.json`, account credentials, VPN session keys, launcher logs, or route state files.
-- The project does not modify firewall rules, DNS servers, registry values, or permanent routes.
-- The task uses Windows `ActiveStore` host routes and can be removed with `Stop` or `Uninstall`.
-- Review the current route table before testing. If the VPN becomes the selected default route, stop the task and restore the physical default route.
+```powershell
+# 确认 VPN 账户当前使用的节点
+& 'C:\Program Files\SoftEther VPN Client\vpncmd_x64.exe' /CLIENT localhost /CMD AccountList
 
-## Project status
+# 查看默认路由、VPN 接口和临时目标路由
+Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0'
+Get-NetAdapter -Name 'VPN - VPN Client'
+Get-NetRoute -AddressFamily IPv4 | Where-Object DestinationPrefix -like '*/32'
 
-The core flow has been tested on Windows with SoftEther VPN Gate: launcher region authorization, second profile authorization, Japanese ordinary egress, and known Raid target selection. DNS/CDN layouts can change; contributions should include fresh local evidence and avoid publishing stale IP ranges.
+# 普通网站应仍显示日本出口
+(Invoke-RestMethod 'https://ifconfig.co/json').country_iso
+```
+
+预期结果是：日本以太网仍然是默认路由；只有本工具管理的目标 `/32` 路由指向 SoftEther 虚拟网卡；独立 Raid 目标没有被添加到 VPN。
+
+## 安全与隐私
+
+- 不修改防火墙、DNS、注册表或永久系统路由。
+- 路由写入 `ActiveStore`，可通过 `Stop` 或 `Uninstall` 撤销。
+- 不要提交 `config.json`、账号密码、VPN 会话密钥、EFT 日志或状态文件。
+- VPN Gate 是公共中继，节点可能随时离线、变更出口或性能波动；自动故障转移只能提高可用性，不能保证每个节点都能通过游戏验证。
+
+## 项目状态与限制
+
+当前核心流程已在 Windows + SoftEther VPN Gate 上验证：CIS 节点动态发现、节点失败后的自动切换、区域/二次授权目标分流、日本普通公网保持直连，以及已知 Raid 目标保持物理网卡出口。BSG 后端、DNS/CDN 和 VPN Gate 列表会变化，提交新问题或贡献时请附上新鲜的本机日志和路由证据，不要直接复制过时的 IP 清单。
