@@ -12,9 +12,18 @@ $keeperPath = Join-Path $projectRoot 'src\Tarkov-CisRouteKeeper.ps1'
 switch ($Action) {
     'Start' {
         Write-Host '正在寻找可用的 CIS VPN Gate 节点...'
-        & $connectorPath -Action Connect
+        $initialConnectError = $null
+        try {
+            & $connectorPath -Action Connect
+        } catch {
+            $initialConnectError = $_.Exception.Message
+            Write-Warning "当前没有节点成功建立会话：$initialConnectError"
+        }
         Write-Host '正在安装并启动后台分流任务...'
         & $keeperPath -Action Install -ConfigPath $ConfigPath
+        if ($initialConnectError) {
+            Write-Warning '后台任务已启动，将继续刷新节点并自动连接；无需反复点击启动。'
+        }
     }
     'Status' {
         & $keeperPath -Action Status -ConfigPath $ConfigPath

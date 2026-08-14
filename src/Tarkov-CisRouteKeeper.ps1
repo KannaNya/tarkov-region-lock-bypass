@@ -26,6 +26,7 @@ function Read-Config {
         TaskName = $defaultTaskName
         VpnInterfaceAlias = 'VPN - VPN Client'
         RefreshSeconds = 30
+        ReconnectSeconds = 60
         GameLogRoots = @()
         TargetHosts = $defaultHosts
         RaidTargets = @()
@@ -42,6 +43,7 @@ $config = Read-Config
 $taskName = [string]$config.TaskName
 $vpnAlias = [string]$config.VpnInterfaceAlias
 $effectiveRefreshSeconds = if ($PSBoundParameters.ContainsKey('RefreshSeconds')) { $RefreshSeconds } else { [int]$config.RefreshSeconds }
+$effectiveReconnectSeconds = [math]::Max(30, [int]$config.ReconnectSeconds)
 
 function Write-Log {
     param([string]$Message)
@@ -185,7 +187,8 @@ function Sync-Routes {
 function Show-Status {
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     $vpn = Get-VpnInfo
-    [pscustomobject]@{ Task = $taskName; TaskState = if ($task) { $task.State } else { 'NotInstalled' }; VpnConnected = [bool]$vpn; VpnInterface = $vpn.Alias; VpnIPv4 = $vpn.IPv4; VpnGateway = $vpn.Gateway } | Format-List
+    $sessionConnected = Test-SoftEtherSession
+    [pscustomobject]@{ Task = $taskName; TaskState = if ($task) { $task.State } else { 'NotInstalled' }; VpnConnected = [bool]($vpn -and $sessionConnected); VpnInterface = $vpn.Alias; VpnIPv4 = $vpn.IPv4; VpnGateway = $vpn.Gateway } | Format-List
     Write-Host 'Observed hosts:'
     Get-ObservedHosts | ForEach-Object { [pscustomobject]@{ Host = $_ } } | Format-Table -AutoSize
     Write-Host 'Selected routes:'
@@ -208,6 +211,24 @@ if ($Action -eq 'Install') {
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+
+    # Register-ScheduledTask -Force updates a task definition but does not
+    # replace an already-running process. Stop and wait first so an older
+    # deployed keeper cannot retain the mutex and keep calling an obsolete
+    # connector after an upgrade.
+    $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($existingTask) {
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        $stopDeadline = (Get-Date).AddSeconds(10)
+        do {
+            Start-Sleep -Milliseconds 250
+            $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        } while ($existingTask -and $existingTask.State -eq 'Running' -and (Get-Date) -lt $stopDeadline)
+        if ($existingTask -and $existingTask.State -eq 'Running') {
+            throw 'The previous route-keeper task did not stop; refusing to start a second copy.'
+        }
+    }
+
     Register-ScheduledTask -TaskName $taskName -Action $taskAction -Trigger $trigger -Principal $principal -Settings $settings -Description 'Keeps current Tarkov CIS backend host routes on the SoftEther adapter.' -Force | Out-Null
     Start-ScheduledTask -TaskName $taskName
     Start-Sleep -Seconds 3
@@ -244,10 +265,10 @@ try {
             }
             if (-not $vpn) {
                 if (Test-Path -LiteralPath $statePath) { Remove-StateRoutes; Write-Log 'VPN disconnected; managed routes removed.' }
-                if ((Get-Date) - $lastConnectAttempt -gt [TimeSpan]::FromMinutes(5) -and (Test-Path -LiteralPath $connectorPath)) {
+                if ((Get-Date) - $lastConnectAttempt -gt [TimeSpan]::FromSeconds($effectiveReconnectSeconds) -and (Test-Path -LiteralPath $connectorPath)) {
                     $lastConnectAttempt = Get-Date
                     Write-Log 'VPN unavailable; refreshing VPN Gate and trying the next CIS relay candidate.'
-                    & $connectorPath -Action Connect 2>&1 | Out-String | ForEach-Object { Write-Log $_.Trim() }
+                    & $connectorPath -Action Connect -InterfaceAlias $vpnAlias 2>&1 | Out-String | ForEach-Object { Write-Log $_.Trim() }
                 }
             } else {
                 Sync-Routes -Vpn $vpn -Targets (Resolve-Targets)

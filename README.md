@@ -21,11 +21,13 @@
 ## 工作方式
 
 1. `Connect-VpnGateCis.ps1` 查询 VPN Gate 官方实时 CSV，按 `RU → UA → 其他配置中的 CIS 候选` 排序。
-2. 对候选节点提取官方公布的 TCP 端口并进行快速连通性测试。
-3. 将第一个可用节点写入 SoftEther 账户 `Tarkov-CIS-PlayOnly` 并建立连接。
+2. 只接受配置中明确声明为 TCP 的 SoftEther 候选；OpenVPN 的 UDP-only 端口不会再被误当成 SoftEther TCP 端口。
+3. 将候选节点写入 SoftEther 账户 `Tarkov-CIS-PlayOnly`，同时验证真实 SoftEther 会话和 VPN DHCP 地址，两者缺一都不会报告成功。
 4. 常驻任务同时检查网卡、IPv4 地址和 `vpncmd AccountStatusGet` 会话状态。
-5. 当前节点失效时，删除本工具管理的旧路由，重新拉取列表并尝试下一个节点；没有可用节点时最多每 5 分钟重试一次。
+5. 当前节点失效时，删除本工具管理的旧路由，立即隔离该节点 15 分钟并尝试下一个；后台默认每 60 秒刷新一次可用候选，不会持续连接同一个失效节点。
 6. 目标域名解析出的地址使用临时 `/32` 路由走 VPN；VPN 默认路由提高 metric，因此日本物理网卡仍是普通流量的默认出口。
+
+成功建立过真实会话的节点会在本机保留 48 小时作为短期备用。该记录位于 Git 忽略的状态文件中，不会作为固定公网 IP 上传到仓库；这可应对 VPN Gate API 暂时漏掉仍可用节点的情况。
 
 Windows 路由按目标 IP 选择，不能按 URL 路径或进程区分流量。如果登录、匹配或其他 HTTPS 服务共享同一个 CDN/IP，它们无法用普通静态路由进一步拆分。独立 Raid 服务器不会因为本项目的已知目标列表而被加入 VPN，但仍应结合本机日志复核实际服务器。
 
@@ -83,6 +85,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 # 手动刷新节点并连接当前最优候选
 .\src\Connect-VpnGateCis.ps1 -Action Connect
 
+# 只刷新并查看当前可尝试的 TCP 候选
+.\src\Connect-VpnGateCis.ps1 -Action Candidates
+
 # 查看 SoftEther 账户和网卡状态
 .\src\Connect-VpnGateCis.ps1 -Action Status
 
@@ -94,6 +99,13 @@ Start-ScheduledTask -TaskName Tarkov-CIS-RouteKeeper
 
 # 卸载任务，并删除本工具创建的临时路由
 .\src\Tarkov-CisRouteKeeper.ps1 -Action Uninstall -ConfigPath .\config.json
+```
+
+如果你通过 VPN Gate 图形列表手动连接了一个脚本列表中暂未出现的 CIS 节点，可在确认其国家/地区后，将当前真实会话记为短期备用：
+
+```powershell
+# 仅在当前会话确实是乌克兰节点时执行；俄罗斯节点把 UA 改为 RU
+.\src\Connect-VpnGateCis.ps1 -Action RememberCurrent -RelayCountry UA
 ```
 
 常驻任务名称为 `Tarkov-CIS-RouteKeeper`。日志、状态文件和本地配置默认不应提交到 Git；仓库的 `.gitignore` 已排除这些运行时内容。
