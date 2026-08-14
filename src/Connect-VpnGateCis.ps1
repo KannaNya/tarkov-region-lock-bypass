@@ -6,12 +6,14 @@
     [string]$InterfaceAlias = 'VPN - VPN Client',
     [string]$NicName = 'VPN',
     [int]$ConnectTimeoutSeconds = 25,
-    [int]$MaxCandidatesPerCountry = 5,
-    [int]$MaxCandidatesTotal = 12,
-    [int]$TcpProbeTimeoutMilliseconds = 2500,
+    [int]$MaxCandidatesPerCountry = 10,
+    [int]$MaxCandidatesTotal = 20,
+    [int]$TcpProbeTimeoutMilliseconds = 1500,
     [int]$DiscoveryTimeoutSeconds = 15,
     [int]$FailureCooldownMinutes = 15,
     [int]$KnownGoodLifetimeHours = 48,
+    [string]$NativeCatalogPath,
+    [int]$NativeCatalogMaxAgeHours = 24,
     [string]$RelayCountry,
     [string]$StatePath
 )
@@ -19,6 +21,10 @@
 $ErrorActionPreference = 'Stop'
 if (-not $StatePath) { $StatePath = Join-Path $PSScriptRoot 'Connect-VpnGateCis.state.json' }
 if (-not (Test-Path -LiteralPath $VpnCmdPath)) { throw "SoftEther vpncmd not found: $VpnCmdPath" }
+$nativeCatalogReaderPath = Join-Path $PSScriptRoot 'VpnGateNativeCatalog.ps1'
+if (-not (Test-Path -LiteralPath $nativeCatalogReaderPath)) { throw "VPN Gate native catalog reader was not found: $nativeCatalogReaderPath" }
+. $nativeCatalogReaderPath
+if (-not $NativeCatalogPath) { $NativeCatalogPath = Join-Path (Split-Path -Parent $VpnCmdPath) 'VPNGate.dat' }
 
 $countryPriority = [ordered]@{
     RU = 100
@@ -134,7 +140,7 @@ function Get-TcpPortFromOpenVpnConfig {
     $null
 }
 
-function Get-CisServers {
+function Get-CisServersFromHttpsApi {
     # VPN Gate's API contains an OpenVPN profile rather than a dedicated
     # SoftEther port field. Its TCP profile uses the same listener displayed
     # in the official SSL-VPN column. UDP-only profiles must never be passed to
@@ -170,8 +176,8 @@ function Get-CisServers {
                 Ping = [int]$_.Ping
                 SpeedMbps = [math]::Round([int64]$_.Speed / 1000000, 1)
                 Sessions = [int]$_.NumVpnSessions
-                Source = 'Live'
-                SourcePriority = 1
+                Source = 'HttpsApi'
+                SourcePriority = 2
             }
         }
     })
@@ -181,6 +187,77 @@ function Get-CisServers {
     # different hostname in the same cycle.
     @($servers | Group-Object Endpoint | ForEach-Object {
         $_.Group | Sort-Object Score -Descending | Select-Object -First 1
+    })
+}
+
+function Get-CisServersFromNativeCatalog {
+    $catalog = Read-VpnGateNativeCatalog -Path $NativeCatalogPath -MaxAgeHours $NativeCatalogMaxAgeHours
+    $servers = @($catalog.Rows | Where-Object CountryShort -in @($countryPriority.Keys) | ForEach-Object {
+        $row = $_
+        $parsedIp = $null
+        $country = ([string]$row.CountryShort).ToUpperInvariant()
+        if ([Net.IPAddress]::TryParse([string]$row.IP, [ref]$parsedIp) -and
+            $parsedIp.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
+            $ports = @([regex]::Matches([string]$row.SslPorts, '(?<!\d)(?<Port>\d{1,5})(?!\d)') | ForEach-Object {
+                $port = [int]$_.Groups['Port'].Value
+                if ($port -ge 1 -and $port -le 65535) { $port }
+            } | Sort-Object -Unique)
+            foreach ($port in $ports) {
+                $hostName = if ($row.Fqdn) { [string]$row.Fqdn } else { [string]$row.IP }
+                $ping = try { [int64]$row.PingToJapan } catch { [int64]9999 }
+                if ($ping -lt 0 -or $ping -gt 60000) { $ping = 9999 }
+                $speed = try { [int64]$row.SpeedToJapan } catch { [int64]0 }
+                $score = try { [int64]$row.Score } catch { [int64]0 }
+                $sessions = try { [int]$row.NumSessions } catch { [int]0 }
+                [pscustomobject]@{
+                    HostName = $hostName
+                    IP = [string]$row.IP
+                    Port = [int]$port
+                    Endpoint = ('{0}:{1}' -f $row.IP, $port)
+                    CountryLong = [string]$row.CountryLong
+                    CountryShort = $country
+                    Priority = [int]$countryPriority[$country]
+                    Score = $score
+                    Ping = [int]$ping
+                    SpeedMbps = [math]::Round($speed / 1000000, 1)
+                    Sessions = $sessions
+                    Source = 'NativeCatalog'
+                    SourcePriority = 3
+                    CatalogTimestampUtc = $catalog.TimestampUtc
+                }
+            }
+        }
+    })
+
+    @($servers | Group-Object Endpoint | ForEach-Object {
+        $_.Group | Sort-Object Score -Descending | Select-Object -First 1
+    })
+}
+
+function Get-CisServers {
+    $servers = @()
+    if (Test-Path -LiteralPath $NativeCatalogPath -PathType Leaf) {
+        try {
+            $servers += @(Get-CisServersFromNativeCatalog)
+        } catch {
+            Write-Warning "SoftEther native VPN Gate catalog could not be used: $($_.Exception.Message)"
+        }
+    }
+
+    try {
+        # Keep the official HTTPS/OpenVPN feed as a fresh secondary source.
+        # It can recover when the local plugin cache is unavailable or stale,
+        # but it does not expose every SoftEther SSL listener.
+        $servers += @(Get-CisServersFromHttpsApi)
+    } catch {
+        if (-not $servers) { throw }
+        Write-Warning "VPN Gate HTTPS fallback refresh failed; using the official plugin's local native catalog: $($_.Exception.Message)"
+    }
+
+    @($servers | Group-Object Endpoint | ForEach-Object {
+        $_.Group |
+            Sort-Object @{Expression = 'SourcePriority'; Descending = $true}, @{Expression = 'Score'; Descending = $true} |
+            Select-Object -First 1
     })
 }
 
@@ -302,9 +379,9 @@ function Select-RelayCandidates {
     }
 
     $eligible = @($Servers | Where-Object { -not $cooling.ContainsKey([string]$_.Endpoint) })
-    $live = @($eligible | Where-Object Source -eq 'Live' | Group-Object CountryShort | ForEach-Object {
+    $live = @($eligible | Where-Object Source -ne 'RecentKnownGood' | Group-Object CountryShort | ForEach-Object {
         $_.Group |
-            Sort-Object @{Expression = { if ($_.Sessions -gt 0) { 1 } else { 0 } }; Descending = $true}, @{Expression = 'Score'; Descending = $true} |
+            Sort-Object @{Expression = 'SourcePriority'; Descending = $true}, @{Expression = { if ($_.Sessions -gt 0) { 1 } else { 0 } }; Descending = $true}, @{Expression = 'Score'; Descending = $true} |
             Select-Object -First $MaxCandidatesPerCountry
     })
     # Keep a small verified fallback pool even when a stale live snapshot has
@@ -431,7 +508,7 @@ $liveServers = @()
 try {
     $liveServers = @(Get-CisServers)
 } catch {
-    Write-Warning "VPN Gate live list refresh failed; trying only recently verified local relays: $($_.Exception.Message)"
+    Write-Warning "VPN Gate candidate discovery failed; trying only recently verified relays: $($_.Exception.Message)"
 }
 $servers = @(Add-KnownGoodCandidates -Servers $liveServers -State $state)
 if (-not $servers) { throw 'No live or recently verified TCP-capable CIS SoftEther relay is available.' }
@@ -450,7 +527,7 @@ if (-not $candidates) {
     throw 'No eligible CIS relay is available.'
 }
 
-Write-Host 'Fresh TCP-capable CIS VPN Gate candidates:'
+Write-Host 'TCP-capable CIS VPN Gate candidates:'
 $candidates | Format-Table CountryShort, Source, HostName, IP, Port, Ping, SpeedMbps, Sessions, Score -AutoSize
 
 $attempted = 0
@@ -504,4 +581,4 @@ foreach ($server in $candidates) {
 }
 
 Disconnect-VpnAccount
-throw "Tried $attempted fresh CIS relay candidate(s); none established a verified SoftEther session and IPv4 lease. Failed endpoints are cooling down before reuse."
+throw "Tried $attempted CIS relay candidate(s); none established a verified SoftEther session and IPv4 lease. Failed endpoints are cooling down before reuse."

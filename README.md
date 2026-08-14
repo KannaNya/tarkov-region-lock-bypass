@@ -2,7 +2,7 @@
 
 这是一个面向 Windows 的 PowerShell 工具，用于帮助在日本网络环境中使用 CIS 区账号的 Escape from Tarkov 玩家，建立“最小化分流”连接：只把已观察到的登录、区域鉴权和相关后端目标送入 SoftEther VPN Gate 的 CIS 出口，普通日本网络、更新下载以及独立 Raid 服务器继续走日本本地网络。
 
-项目不依赖 Python，也不使用网上流传的固定 Tarkov IP 清单。它会定期重新解析目标域名，并从近期 EFT 日志中发现 lobby/WSN 主机名；VPN Gate 中继失效时，会重新查询官方实时列表，自动测试并切换到下一个可用的 CIS 候选节点。
+项目不依赖 Python，也不使用网上流传的固定 Tarkov IP 清单。它会定期重新解析目标域名，并从近期 EFT 日志中发现 lobby/WSN 主机名；VPN Gate 中继失效时，会合并 SoftEther 原生节点目录与官方 HTTPS 列表，自动测试并切换到下一个可用的 CIS 候选节点。
 
 ## 适合哪些人
 
@@ -20,14 +20,17 @@
 
 ## 工作方式
 
-1. `Connect-VpnGateCis.ps1` 查询 VPN Gate 官方实时 CSV，按 `RU → UA → 其他配置中的 CIS 候选` 排序。
-2. 只接受配置中明确声明为 TCP 的 SoftEther 候选；OpenVPN 的 UDP-only 端口不会再被误当成 SoftEther TCP 端口。
-3. 将候选节点写入 SoftEther 账户 `Tarkov-CIS-PlayOnly`，同时验证真实 SoftEther 会话和 VPN DHCP 地址，两者缺一都不会报告成功。
-4. 常驻任务同时检查网卡、IPv4 地址和 `vpncmd AccountStatusGet` 会话状态。
-5. 当前节点失效时，删除本工具管理的旧路由，立即隔离该节点 15 分钟并尝试下一个；后台默认每 60 秒刷新一次可用候选，不会持续连接同一个失效节点。
-6. 目标域名解析出的地址使用临时 `/32` 路由走 VPN；VPN 默认路由提高 metric，因此日本物理网卡仍是普通流量的默认出口。
+1. `Connect-VpnGateCis.ps1` 优先读取 SoftEther 官方插件已接受并缓存的 `VPNGate.dat` 原生目录，从 `SslPorts` 取得准确的 SoftEther SSL/TCP 端口。
+2. 同时查询 VPN Gate 官方 HTTPS/OpenVPN 列表作为新鲜的第二数据源，再按 `RU → UA → 其他配置中的 CIS 候选` 排序并去重。
+3. 只接受明确声明了 TCP 端口的候选；原生目录中 `SslPorts` 为空的行，以及 OpenVPN 的 UDP-only 端口，都不会被误当成 SoftEther TCP 端口。
+4. 将候选节点写入 SoftEther 账户 `Tarkov-CIS-PlayOnly`，同时验证真实 SoftEther 会话和 VPN DHCP 地址，两者缺一都不会报告成功。
+5. 常驻任务同时检查网卡、IPv4 地址和 `vpncmd AccountStatusGet` 会话状态。
+6. 当前节点失效时，删除本工具管理的旧路由，立即隔离该节点 15 分钟并尝试下一个；后台默认每 60 秒重新选择候选，不会持续连接同一个失效节点。
+7. 目标域名解析出的地址使用临时 `/32` 路由走 VPN；VPN 默认路由提高 metric，因此日本物理网卡仍是普通流量的默认出口。
 
 成功建立过真实会话的节点会在本机保留 48 小时作为短期备用。该记录位于 Git 忽略的状态文件中，不会作为固定公网 IP 上传到仓库；这可应对 VPN Gate API 暂时漏掉仍可用节点的情况。
+
+原生目录默认只接受 24 小时内的缓存。打开 SoftEther 的“VPN Gate 公共 VPN 中继服务器”并刷新列表，会由官方插件更新该文件；如果文件不存在或过期，工具仍会自动使用 HTTPS 数据源和近期验证成功的节点。原生服务端目录通过 HTTP 分发并附带签名，因此本项目目前不会绕过官方插件直接下载并信任未经校验的原生响应。
 
 Windows 路由按目标 IP 选择，不能按 URL 路径或进程区分流量。如果登录、匹配或其他 HTTPS 服务共享同一个 CDN/IP，它们无法用普通静态路由进一步拆分。独立 Raid 服务器不会因为本项目的已知目标列表而被加入 VPN，但仍应结合本机日志复核实际服务器。
 
@@ -77,7 +80,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\src\Tarkov-CisRouteKeeper.ps1 -Action Status -ConfigPath .\config.json
 ```
 
-首次连接时，脚本会优先尝试俄罗斯节点；如果俄罗斯节点没有响应，就会继续尝试乌克兰及其他配置中的 CIS 节点。安装常驻任务后，即使当前 VPN 断开，任务也会自动执行同样的故障转移流程，不需要每次手动加入服务器。
+首次连接时，脚本会优先尝试原生目录中的俄罗斯 SoftEther 节点；如果俄罗斯节点没有响应，就会继续尝试乌克兰及其他配置中的 CIS 节点。安装常驻任务后，即使当前 VPN 断开，任务也会自动执行同样的故障转移流程，不需要每次手动加入服务器。
 
 ## 日常管理
 
@@ -85,7 +88,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 # 手动刷新节点并连接当前最优候选
 .\src\Connect-VpnGateCis.ps1 -Action Connect
 
-# 只刷新并查看当前可尝试的 TCP 候选
+# 查看原生目录与 HTTPS 数据源合并后的 TCP 候选
 .\src\Connect-VpnGateCis.ps1 -Action Candidates
 
 # 查看 SoftEther 账户和网卡状态

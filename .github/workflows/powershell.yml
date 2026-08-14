@@ -11,7 +11,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check PowerShell scripts
         shell: pwsh
-        run: ./tests/syntax-check.ps1
+        run: |
+          ./tests/syntax-check.ps1
+          ./tests/native-catalog-check.ps1
       - name: Check Windows PowerShell 5.1 compatibility
         shell: powershell
-        run: .\tests\syntax-check.ps1
+        run: |
+          .\tests\syntax-check.ps1
+          .\tests\native-catalog-check.ps1
