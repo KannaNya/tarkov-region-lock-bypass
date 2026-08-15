@@ -1,15 +1,27 @@
-name: PowerShell syntax
+name: PowerShell validation
 
 on:
   push:
   pull_request:
 
 jobs:
-  syntax:
+  test:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: Check PowerShell scripts
         shell: pwsh
-        run: ./tests/syntax-check.ps1
-
+        run: |
+          ./tests/syntax-check.ps1
+          ./tests/native-catalog-check.ps1
+          ./tests/connector-failover-check.ps1
+          ./tests/gui-control-check.ps1
+          ./tests/route-keeper-check.ps1
+      - name: Check Windows PowerShell 5.1 compatibility
+        shell: powershell
+        run: |
+          .\tests\syntax-check.ps1
+          .\tests\native-catalog-check.ps1
+          .\tests\connector-failover-check.ps1
+          .\tests\gui-control-check.ps1
+          .\tests\route-keeper-check.ps1
