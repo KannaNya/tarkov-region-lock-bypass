@@ -10,6 +10,7 @@ $scriptRoot = (Resolve-Path $PSScriptRoot).Path
 $statePath = Join-Path $scriptRoot 'Tarkov-CisRouteKeeper.state.json'
 $pidPath = Join-Path $scriptRoot 'Tarkov-CisRouteKeeper.pid'
 $logPath = Join-Path $scriptRoot 'Tarkov-CisRouteKeeper.log'
+$logMaxBytes = 2MB
 $defaultTaskName = 'Tarkov-CIS-RouteKeeper'
 $connectorPath = Join-Path $scriptRoot 'Connect-VpnGateCis.ps1'
 $vpnCmdPath = 'C:\Program Files\SoftEther VPN Client\vpncmd_x64.exe'
@@ -46,8 +47,25 @@ $effectiveRefreshSeconds = if ($PSBoundParameters.ContainsKey('RefreshSeconds'))
 $effectiveReconnectSeconds = [math]::Max(30, [int]$config.ReconnectSeconds)
 
 function Write-Log {
-    param([string]$Message)
-    Add-Content -LiteralPath $logPath -Encoding UTF8 -Value ('{0} {1}' -f (Get-Date -Format o), $Message)
+    param([AllowEmptyString()][string]$Message)
+
+    # Keep one rotated copy so a permanently running task cannot grow the log
+    # without bound.  The connector output is already bounded by its candidate
+    # limits, so a single 2 MiB rollover is sufficient here.
+    if (Test-Path -LiteralPath $logPath -PathType Leaf) {
+        $currentLog = Get-Item -LiteralPath $logPath -ErrorAction SilentlyContinue
+        if ($currentLog -and $currentLog.Length -ge $logMaxBytes) {
+            $rotatedLog = "$logPath.1"
+            Remove-Item -LiteralPath $rotatedLog -Force -ErrorAction SilentlyContinue
+            Move-Item -LiteralPath $logPath -Destination $rotatedLog -Force
+        }
+    }
+
+    $timestamp = Get-Date -Format o
+    $lines = @(([string]$Message) -split '\r?\n') | ForEach-Object {
+        '{0} {1}' -f $timestamp, $_
+    }
+    Add-Content -LiteralPath $logPath -Encoding UTF8 -Value $lines
 }
 
 function Assert-Administrator {
@@ -62,7 +80,12 @@ function Get-VpnInfo {
     $adapter = Get-NetAdapter -InterfaceAlias $vpnAlias -ErrorAction SilentlyContinue
     if (-not $adapter -or $adapter.Status -ne 'Up') { return $null }
     $ipConfig = Get-NetIPConfiguration -InterfaceIndex $adapter.ifIndex
-    $ip = $ipConfig.IPv4Address.IPAddress | Select-Object -First 1
+    # An APIPA lease can remain briefly after SoftEther disconnects.  Treating
+    # it as a usable VPN address creates a false "connected" state and leaves
+    # route reconciliation running against a dead adapter.
+    $ip = $ipConfig.IPv4Address |
+        Where-Object { $_.IPAddress -and $_.IPAddress -notlike '169.254.*' } |
+        Select-Object -ExpandProperty IPAddress -First 1
     $gateway = $ipConfig.IPv4DefaultGateway.NextHop | Select-Object -First 1
     if (-not $ip -or -not $gateway) { return $null }
     [pscustomobject]@{ InterfaceIndex = [int]$adapter.ifIndex; Alias = $adapter.InterfaceAlias; IPv4 = $ip; Gateway = $gateway }
@@ -70,8 +93,56 @@ function Get-VpnInfo {
 
 function Test-SoftEtherSession {
     if (-not (Test-Path -LiteralPath $vpnCmdPath)) { return $false }
-    & $vpnCmdPath /CLIENT localhost /CMD AccountStatusGet $vpnAccountName 2>$null | Out-Null
-    return ($LASTEXITCODE -eq 0)
+    $output = @(& $vpnCmdPath /CSV /CLIENT localhost /CMD AccountStatusGet $vpnAccountName 2>$null)
+    if ($LASTEXITCODE -ne 0) { return $false }
+
+    # AccountStatusGet returns exit code 0 even when the account exists but is
+    # not connected.  An SID is emitted only for an established session and is
+    # locale-independent, unlike the human-readable status text.
+    $text = ($output | ForEach-Object { [string]$_ }) -join "`n"
+    return ($text -match '(?im)\bSID-[A-Za-z0-9-]+\b')
+}
+
+function Get-StreamRecordType {
+    param($Record)
+    if ($Record -is [System.Management.Automation.ErrorRecord]) { return 'error' }
+    if ($Record -is [System.Management.Automation.WarningRecord]) { return 'warning' }
+    if ($Record -is [System.Management.Automation.VerboseRecord]) { return 'verbose' }
+    if ($Record -is [System.Management.Automation.DebugRecord]) { return 'debug' }
+    if ($Record -is [System.Management.Automation.InformationRecord]) { return 'information' }
+    if ($Record -is [System.Management.Automation.ProgressRecord]) { return 'progress' }
+    'output'
+}
+
+function Get-StreamRecordLines {
+    param($Record)
+    $streamType = Get-StreamRecordType -Record $Record
+    if ($Record -is [System.Management.Automation.ErrorRecord]) {
+        $text = $Record.ToString()
+    } elseif ($Record -is [System.Management.Automation.WarningRecord] -or
+        $Record -is [System.Management.Automation.VerboseRecord] -or
+        $Record -is [System.Management.Automation.DebugRecord]) {
+        $text = [string]$Record.Message
+    } elseif ($Record -is [System.Management.Automation.InformationRecord]) {
+        $text = [string]$Record.MessageData
+    } elseif ($Record -is [System.Management.Automation.ProgressRecord]) {
+        $text = '{0}: {1}' -f $Record.Activity, $Record.StatusDescription
+    } elseif ($Record -is [string]) {
+        $text = $Record
+    } else {
+        # Connector success output can contain formatted PSCustomObjects (for
+        # example its candidate table), so preserve its rendered content.
+        $text = $Record | Out-String -Width 4096
+    }
+    [pscustomobject]@{ Stream = $streamType; Lines = @(([string]$text) -split '\r?\n') }
+}
+
+function Write-ConnectorStream {
+    param($Record)
+    $rendered = Get-StreamRecordLines -Record $Record
+    foreach ($line in @($rendered.Lines)) {
+        Write-Log ("connector[{0}] {1}" -f $rendered.Stream, $line)
+    }
 }
 
 function Get-ObservedHosts {
@@ -104,7 +175,18 @@ function Resolve-Targets {
             }
         } catch { Write-Log "DNS resolution failed for ${hostName}: $($_.Exception.Message)" }
     }
-    @($result | Sort-Object IPAddress -Unique)
+    # Routing is still one /32 per IP, but keep every hostname that resolved
+    # to that IP.  Cloudflare/shared backend addresses commonly serve lobby,
+    # WSN and launcher hosts at once; dropping the relation made Status output
+    # look as if those hosts had never been observed.
+    foreach ($group in @($result | Group-Object IPAddress | Sort-Object Name)) {
+        $hosts = [string[]]@($group.Group | ForEach-Object Host | Sort-Object -Unique)
+        [pscustomobject]@{
+            Host = $hosts[0]
+            HostNames = $hosts
+            IPAddress = [string]$group.Name
+        }
+    }
 }
 
 function Read-State {
@@ -188,15 +270,33 @@ function Show-Status {
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     $vpn = Get-VpnInfo
     $sessionConnected = Test-SoftEtherSession
-    [pscustomobject]@{ Task = $taskName; TaskState = if ($task) { $task.State } else { 'NotInstalled' }; VpnConnected = [bool]($vpn -and $sessionConnected); VpnInterface = $vpn.Alias; VpnIPv4 = $vpn.IPv4; VpnGateway = $vpn.Gateway } | Format-List
+    $vpnConnected = [bool]($vpn -and $sessionConnected)
+    [pscustomobject]@{
+        Task = $taskName
+        TaskState = if ($task) { $task.State } else { 'NotInstalled' }
+        VpnConnected = $vpnConnected
+        VpnInterface = if ($vpn) { $vpn.Alias } else { $null }
+        VpnIPv4 = if ($vpn) { $vpn.IPv4 } else { $null }
+        VpnGateway = if ($vpn) { $vpn.Gateway } else { $null }
+    } | Format-List
     Write-Host 'Observed hosts:'
     Get-ObservedHosts | ForEach-Object { [pscustomobject]@{ Host = $_ } } | Format-Table -AutoSize
     Write-Host 'Selected routes:'
     $targets = Resolve-Targets
     @(foreach ($target in $targets) {
         $route = Find-NetRoute -RemoteIPAddress $target.IPAddress | Where-Object NextHop | Select-Object -First 1
-        [pscustomobject]@{ Host = $target.Host; IPAddress = $target.IPAddress; Interface = $route.InterfaceAlias; IfIndex = $route.InterfaceIndex; NextHop = $route.NextHop }
-    }) | Format-Table -AutoSize
+        $viaVpn = $vpnConnected -and $route -and
+            ([int]$route.InterfaceIndex -eq [int]$vpn.InterfaceIndex) -and
+            ([string]$route.NextHop -eq [string]$vpn.Gateway)
+        [pscustomobject]@{
+            Hosts = ($target.HostNames -join ', ')
+            IPAddress = $target.IPAddress
+            RouteState = if (-not $route) { 'NoRoute' } elseif ($viaVpn) { 'VPN' } else { 'Other' }
+            Interface = if ($route) { $route.InterfaceAlias } else { $null }
+            IfIndex = if ($route) { $route.InterfaceIndex } else { $null }
+            NextHop = if ($route) { $route.NextHop } else { $null }
+        }
+    }) | Format-Table IPAddress, RouteState, Interface, IfIndex, NextHop, Hosts -AutoSize -Wrap
 }
 
 if ($Action -eq 'Status') { Show-Status; exit 0 }
@@ -268,7 +368,12 @@ try {
                 if ((Get-Date) - $lastConnectAttempt -gt [TimeSpan]::FromSeconds($effectiveReconnectSeconds) -and (Test-Path -LiteralPath $connectorPath)) {
                     $lastConnectAttempt = Get-Date
                     Write-Log 'VPN unavailable; refreshing VPN Gate and trying the next CIS relay candidate.'
-                    & $connectorPath -Action Connect -InterfaceAlias $vpnAlias 2>&1 | Out-String | ForEach-Object { Write-Log $_.Trim() }
+                    # Redirect every PowerShell stream into the success stream
+                    # and log each record/line with its stream type.  This keeps
+                    # warnings, verbose diagnostics and connector errors visible
+                    # in the long-running task log.
+                    & $connectorPath -Action Connect -InterfaceAlias $vpnAlias *>&1 |
+                        ForEach-Object { Write-ConnectorStream -Record $_ }
                 }
             } else {
                 Sync-Routes -Vpn $vpn -Targets (Resolve-Targets)

@@ -52,6 +52,9 @@ $configExample = Join-Path $projectRoot 'config.example.json'
 $controllerPath = Join-Path $projectRoot 'scripts\control.ps1'
 $taskName = 'Tarkov-CIS-RouteKeeper'
 $vpnAlias = 'VPN - VPN Client'
+$vpnCmdPath = 'C:\Program Files\SoftEther VPN Client\vpncmd_x64.exe'
+$vpnAccountName = 'Tarkov-CIS-PlayOnly'
+$keeperLogPath = Join-Path $projectRoot 'src\Tarkov-CisRouteKeeper.log'
 
 function Ensure-Configuration {
     if (-not (Test-Path -LiteralPath $configFile)) {
@@ -211,6 +214,120 @@ $script:activeProcess = $null
 $script:stdoutPath = $null
 $script:stderrPath = $null
 
+function Get-SoftEtherSessionState {
+    # AccountStatusGet is the source of truth for the VPN session.  The
+    # adapter can retain its DHCP lease briefly after a relay disconnects, so
+    # an interface/IP check alone must never be shown as "已连接".
+    if (-not (Test-Path -LiteralPath $vpnCmdPath -PathType Leaf)) {
+        return [pscustomobject]@{ State = 'Unavailable'; Detail = '找不到 SoftEther vpncmd' }
+    }
+
+    $token = [Guid]::NewGuid().ToString('N')
+    $outPath = Join-Path ([IO.Path]::GetTempPath()) "tarkov-cis-gui-status-$token.out.log"
+    $errPath = Join-Path ([IO.Path]::GetTempPath()) "tarkov-cis-gui-status-$token.err.log"
+    $process = $null
+    try {
+        # Keep the account name unquoted here.  Start-Process passes embedded
+        # quotes through to vpncmd, where they become part of the account
+        # name instead of shell quoting.
+        $arguments = '/CLIENT localhost /CMD AccountStatusGet {0}' -f $vpnAccountName
+        $process = Start-Process -FilePath $vpnCmdPath -ArgumentList $arguments `
+            -WindowStyle Hidden -RedirectStandardOutput $outPath `
+            -RedirectStandardError $errPath -PassThru
+        if (-not $process.WaitForExit(1500)) {
+            try { $process.Kill() } catch {}
+            return [pscustomobject]@{ State = 'Unknown'; Detail = 'AccountStatusGet 超时' }
+        }
+
+        $process.Refresh()
+        $exitCode = [int]$process.ExitCode
+        $output = if (Test-Path -LiteralPath $outPath) {
+            # vpncmd writes UTF-8 without a BOM.  Reading with the platform
+            # default encoding breaks Chinese AccountStatusGet labels under
+            # Windows PowerShell 5.1, so decode the bytes explicitly.
+            [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($outPath))
+        } else { '' }
+        if ($exitCode -ne 0) {
+            return [pscustomobject]@{ State = 'NotConnected'; Detail = 'AccountStatusGet 未返回已建立会话' }
+        }
+
+        $statusMatch = [regex]::Match($output, '(?im)^\s*(?:会话状态|Session\s+Status)\s*\|\s*(?<Value>.+?)\s*$')
+        $hasEstablishedSession = $output -match '(?im)\bSID-[A-Za-z0-9-]+\b'
+        if ($hasEstablishedSession) {
+            $detail = if ($statusMatch.Success) { $statusMatch.Groups['Value'].Value.Trim() } else { 'SoftEther SID 会话已建立' }
+            return [pscustomobject]@{ State = 'Connected'; Detail = $detail }
+        }
+        if (-not $statusMatch.Success) {
+            return [pscustomobject]@{ State = 'Unknown'; Detail = 'AccountStatusGet 未返回可识别的会话状态' }
+        }
+
+        $statusValue = $statusMatch.Groups['Value'].Value.Trim()
+        if ($statusValue -match '(?i)连接完成|会话建立|connection\s+(?:completed|established)|session\s+established|\bconnected\b') {
+            return [pscustomobject]@{ State = 'Connected'; Detail = $statusValue }
+        }
+        if ($statusValue -match '(?i)连接中|正在连接|connecting') {
+            return [pscustomobject]@{ State = 'Connecting'; Detail = $statusValue }
+        }
+        if ($statusValue -match '(?i)未连接|断开|disconnected|not\s+connected|offline') {
+            return [pscustomobject]@{ State = 'NotConnected'; Detail = $statusValue }
+        }
+        [pscustomobject]@{ State = 'Unknown'; Detail = $statusValue }
+    } catch {
+        [pscustomobject]@{ State = 'Unknown'; Detail = $_.Exception.Message }
+    } finally {
+        if ($process) { $process.Dispose() }
+        if (Test-Path -LiteralPath $outPath) { Remove-Item -LiteralPath $outPath -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $errPath) { Remove-Item -LiteralPath $errPath -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Get-VpnAdapterLease {
+    $adapter = Get-NetAdapter -Name $vpnAlias -ErrorAction SilentlyContinue
+    if (-not $adapter -or $adapter.Status -ne 'Up') { return $null }
+    $ipConfig = Get-NetIPConfiguration -InterfaceIndex $adapter.ifIndex -ErrorAction SilentlyContinue
+    $ip = @($ipConfig.IPv4Address | ForEach-Object { $_.IPAddress } | Where-Object {
+        $_ -and $_ -notlike '169.254.*' -and $_ -ne '0.0.0.0'
+    } | Select-Object -First 1)
+    $gateway = @($ipConfig.IPv4DefaultGateway | ForEach-Object { $_.NextHop } | Select-Object -First 1)
+    if (-not $ip) { return $null }
+    [pscustomobject]@{
+        Adapter = $adapter
+        IPv4 = [string]$ip[0]
+        Gateway = if ($gateway) { [string]$gateway[0] } else { $null }
+    }
+}
+
+function Get-ReconnectState {
+    param(
+        [string]$TaskState,
+        [string]$SessionState,
+        [bool]$HasLease
+    )
+
+    if ($TaskState -ne 'Running') { return '后台未运行' }
+    if ($SessionState -eq 'Connected' -and $HasLease) { return '守护正常' }
+    if ($SessionState -eq 'Connecting') { return '正在建立会话' }
+
+    $recentFailover = $false
+    if (Test-Path -LiteralPath $keeperLogPath -PathType Leaf) {
+        $recentLines = @(Get-Content -Tail 30 -LiteralPath $keeperLogPath -ErrorAction SilentlyContinue)
+        foreach ($line in $recentLines) {
+            if ($line -notmatch '(?i)VPN unavailable|failover|refreshing VPN Gate|session is no longer established') { continue }
+            $timestampMatch = [regex]::Match([string]$line, '^(?<Timestamp>\d{4}-\d{2}-\d{2}T[^ ]+)')
+            if (-not $timestampMatch.Success) { $recentFailover = $true; break }
+            try {
+                if ([datetimeoffset]::Now - [datetimeoffset]::Parse($timestampMatch.Groups['Timestamp'].Value) -lt [TimeSpan]::FromMinutes(5)) {
+                    $recentFailover = $true
+                    break
+                }
+            } catch { $recentFailover = $true; break }
+        }
+    }
+    if ($recentFailover) { return '正在重连' }
+    if ($HasLease -and $SessionState -ne 'Connected') { return '正在确认会话' }
+    '等待后台重连'
+}
+
 function Write-OutputText {
     param([string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return }
@@ -259,27 +376,37 @@ function Save-ConfigurationFromUi {
 function Refresh-StatusSummary {
     try {
         $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        $taskState = if ($task) { [string]$task.State } else { 'NotInstalled' }
         if ($task) {
-            $taskValue.Text = if ($task.State -eq 'Running') { '运行中' } else { [string]$task.State }
-            $taskValue.ForeColor = if ($task.State -eq 'Running') { [Drawing.Color]::DarkGreen } else { [Drawing.SystemColors]::ControlText }
+            $taskValue.Text = if ($taskState -eq 'Running') { '运行中' } else { $taskState }
+            $taskValue.ForeColor = if ($taskState -eq 'Running') { [Drawing.Color]::DarkGreen } else { [Drawing.SystemColors]::ControlText }
         } else {
             $taskValue.Text = '未安装'
             $taskValue.ForeColor = [Drawing.SystemColors]::GrayText
         }
 
-        $adapter = Get-NetAdapter -Name $vpnAlias -ErrorAction SilentlyContinue
-        $ip = $null
-        if ($adapter -and $adapter.Status -eq 'Up') {
-            $ip = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-                Where-Object { $_.IPAddress -notlike '169.254.*' } |
-                Select-Object -First 1
-        }
-        if ($ip) {
+        $lease = Get-VpnAdapterLease
+        $session = Get-SoftEtherSessionState
+        $hasLease = [bool]$lease
+        $sessionState = [string]$session.State
+        if ($sessionState -eq 'Connected' -and $hasLease) {
             $vpnValue.Text = '已连接'
             $vpnValue.ForeColor = [Drawing.Color]::DarkGreen
-            $ipValue.Text = $ip.IPAddress
+            $ipValue.Text = $lease.IPv4
+        } elseif ($sessionState -eq 'Connected') {
+            $vpnValue.Text = '会话已连接，等待接口地址'
+            $vpnValue.ForeColor = [Drawing.Color]::DarkOrange
+            $ipValue.Text = '—'
+        } elseif ($sessionState -eq 'Connecting') {
+            $vpnValue.Text = '正在连接'
+            $vpnValue.ForeColor = [Drawing.Color]::DarkOrange
+            $ipValue.Text = if ($hasLease) { $lease.IPv4 } else { '—' }
+        } elseif ($hasLease) {
+            $vpnValue.Text = '适配器残留（会话未建立）'
+            $vpnValue.ForeColor = [Drawing.Color]::DarkOrange
+            $ipValue.Text = $lease.IPv4
         } else {
-            $vpnValue.Text = '未连接'
+            $vpnValue.Text = if ($sessionState -eq 'Unavailable') { '无法检查会话' } else { '未连接' }
             $vpnValue.ForeColor = [Drawing.Color]::DarkRed
             $ipValue.Text = '—'
         }
@@ -291,7 +418,25 @@ function Refresh-StatusSummary {
                 $_.RouteMetric + [int]$interfaceMetric
             } } |
             Select-Object -First 1
-        $routeValue.Text = if ($defaultRoute) { [string]$defaultRoute.InterfaceAlias } else { '未知' }
+        $routeAlias = if ($defaultRoute) { [string]$defaultRoute.InterfaceAlias } else { '未知' }
+        $routeValue.Text = $routeAlias
+
+        $reconnectState = Get-ReconnectState -TaskState $taskState -SessionState $sessionState -HasLease $hasLease
+        $statusSummary = '后台 {0} | VPN会话 {1} | 重连 {2} | 普通出口 {3}' -f `
+            $(if ($taskState -eq 'Running') { '运行中' } elseif ($taskState -eq 'NotInstalled') { '未安装' } else { $taskState }), `
+            $(switch ($sessionState) {
+                'Connected' { if ($hasLease) { '已连接' } else { '已连接/待接口' }; break }
+                'Connecting' { '连接中'; break }
+                'NotConnected' { '未连接'; break }
+                'Unavailable' { '不可用'; break }
+                default { '未知' }
+            }),
+            $reconnectState,
+            $routeAlias
+        $operationStatus.ToolTipText = "${statusSummary}`r`n$($session.Detail)"
+        if (-not $script:activeProcess -or $script:activeProcess.HasExited) {
+            $operationStatus.Text = $statusSummary
+        }
     } catch {
         $operationStatus.Text = "状态检查失败：$($_.Exception.Message)"
     }
@@ -303,6 +448,16 @@ function Start-ControlAction {
 
     try {
         Save-ConfigurationFromUi
+        if ($Action -eq 'Start') {
+            $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            if ($existingTask -and [string]$existingTask.State -eq 'Running') {
+                $outputBox.Clear()
+                Write-OutputText '后台任务已经在运行；忽略重复启动，后台会自动完成连接或重连。'
+                $operationStatus.Text = '后台已运行；未重复启动连接器'
+                Refresh-StatusSummary
+                return
+            }
+        }
         $outputBox.Clear()
         Write-OutputText "开始执行：$Action"
         Set-ControlsBusy -Busy $true -Message '正在执行，请稍候...'

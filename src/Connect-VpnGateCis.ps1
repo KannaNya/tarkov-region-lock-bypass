@@ -6,6 +6,9 @@
     [string]$InterfaceAlias = 'VPN - VPN Client',
     [string]$NicName = 'VPN',
     [int]$ConnectTimeoutSeconds = 25,
+    [int]$FailoverTimeoutSeconds = 180,
+    [int]$DisconnectWaitSeconds = 15,
+    [int]$ResourceBusyRetryCount = 2,
     [int]$MaxCandidatesPerCountry = 10,
     [int]$MaxCandidatesTotal = 20,
     [int]$TcpProbeTimeoutMilliseconds = 1500,
@@ -15,12 +18,13 @@
     [string]$NativeCatalogPath,
     [int]$NativeCatalogMaxAgeHours = 24,
     [string]$RelayCountry,
-    [string]$StatePath
+    [string]$StatePath,
+    [switch]$TestMode
 )
 
 $ErrorActionPreference = 'Stop'
 if (-not $StatePath) { $StatePath = Join-Path $PSScriptRoot 'Connect-VpnGateCis.state.json' }
-if (-not (Test-Path -LiteralPath $VpnCmdPath)) { throw "SoftEther vpncmd not found: $VpnCmdPath" }
+if (-not $TestMode -and -not (Test-Path -LiteralPath $VpnCmdPath)) { throw "SoftEther vpncmd not found: $VpnCmdPath" }
 $nativeCatalogReaderPath = Join-Path $PSScriptRoot 'VpnGateNativeCatalog.ps1'
 if (-not (Test-Path -LiteralPath $nativeCatalogReaderPath)) { throw "VPN Gate native catalog reader was not found: $nativeCatalogReaderPath" }
 . $nativeCatalogReaderPath
@@ -46,14 +50,26 @@ function Invoke-VpnCmd {
     $output = @(& $VpnCmdPath /CLIENT localhost /CMD @Arguments 2>&1)
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
-        throw "vpncmd failed with exit code ${exitCode}: $($Arguments[0])"
+        $exception = [InvalidOperationException]::new("vpncmd failed with exit code ${exitCode}: $($Arguments[0])")
+        $exception.Data['ExitCode'] = [int]$exitCode
+        $exception.Data['VpnCommand'] = [string]$Arguments[0]
+        throw $exception
     }
     $output
 }
 
 function Test-SoftEtherSession {
-    & $VpnCmdPath /CLIENT localhost /CMD AccountStatusGet $AccountName 2>$null | Out-Null
-    $LASTEXITCODE -eq 0
+    $output = @(& $VpnCmdPath /CSV /CLIENT localhost /CMD AccountStatusGet $AccountName 2>$null)
+    if ($LASTEXITCODE -ne 0) { return $false }
+    Test-EstablishedSoftEtherSessionOutput -Output $output
+}
+
+function Test-EstablishedSoftEtherSessionOutput {
+    param([object[]]$Output)
+    $text = (@($Output) | ForEach-Object { [string]$_ }) -join "`n"
+    # SID is locale-independent and is emitted for an established SoftEther
+    # session. Human-readable status text changes with the client language.
+    $text -match '(?im)\bSID-[A-Za-z0-9-]+\b'
 }
 
 function Get-VpnLease {
@@ -74,6 +90,30 @@ function Get-VpnLease {
 function Get-ConnectedVpnInfo {
     if (-not (Test-SoftEtherSession)) { return $null }
     Get-VpnLease
+}
+
+function Test-VpnAdapterReleased {
+    $adapter = Get-NetAdapter -InterfaceAlias $InterfaceAlias -ErrorAction SilentlyContinue
+    if (-not $adapter) { return $true }
+    $ipConfig = Get-NetIPConfiguration -InterfaceIndex $adapter.ifIndex -ErrorAction SilentlyContinue
+    if (-not $ipConfig) { return $true }
+    $hasAddress = @($ipConfig.IPv4Address | Where-Object {
+        $_.IPAddress -and $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -ne '0.0.0.0'
+    }).Count -gt 0
+    $hasGateway = @($ipConfig.IPv4DefaultGateway | Where-Object NextHop).Count -gt 0
+    -not $hasAddress -and -not $hasGateway
+}
+
+function Wait-SoftEtherOffline {
+    param([int]$TimeoutSeconds = $DisconnectWaitSeconds)
+    $deadline = (Get-Date).AddSeconds([math]::Max(1, $TimeoutSeconds))
+    do {
+        $sessionOnline = Test-SoftEtherSession
+        $adapterReleased = Test-VpnAdapterReleased
+        if (-not $sessionOnline -and $adapterReleased) { return $true }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    $false
 }
 
 function Get-ConfiguredAccountEndpoint {
@@ -103,8 +143,73 @@ function Get-ConfiguredAccountEndpoint {
 }
 
 function Disconnect-VpnAccount {
+    param([int]$TimeoutSeconds = $DisconnectWaitSeconds)
     & $VpnCmdPath /CLIENT localhost /CMD AccountDisconnect $AccountName 2>$null | Out-Null
-    Start-Sleep -Milliseconds 500
+    $disconnectExitCode = $LASTEXITCODE
+    if (-not (Wait-SoftEtherOffline -TimeoutSeconds $TimeoutSeconds)) {
+        throw "SoftEther account '$AccountName' did not fully release its session and VPN adapter within $TimeoutSeconds second(s)."
+    }
+    if ($disconnectExitCode -ne 0 -and (Test-SoftEtherSession)) {
+        throw "vpncmd AccountDisconnect failed with exit code $disconnectExitCode."
+    }
+}
+
+function Test-SoftEtherResourceBusyError {
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+    $exception = $ErrorRecord.Exception
+    if ($exception -and $exception.Data -and $exception.Data.Contains('ExitCode')) {
+        try { if ([int]$exception.Data['ExitCode'] -eq 43) { return $true } } catch {}
+    }
+    [string]$message = if ($exception) { $exception.Message } else { [string]$ErrorRecord }
+    $message -match '(?i)(?:exit\s*code|error\s*code|返回码|错误码)\s*[:=]?\s*43(?:\D|$)'
+}
+
+function Enter-ConnectorMutex {
+    param([int]$TimeoutSeconds = 0)
+    $mutex = $null
+    $mutexName = 'Global\TarkovCisVpnGateConnector'
+    try {
+        [bool]$createdNew = $false
+        $mutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$createdNew)
+    } catch {
+        # Some locked-down Windows sessions do not allow creating a Global
+        # kernel object. Local still serializes the GUI and scheduled task
+        # when they run in the same interactive account.
+        $mutexName = 'Local\TarkovCisVpnGateConnector'
+        [bool]$createdNew = $false
+        $mutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$createdNew)
+    }
+
+    try {
+        $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds([math]::Max(0, $TimeoutSeconds)))
+    } catch [Threading.AbandonedMutexException] {
+        $acquired = $true
+    }
+    if (-not $acquired) {
+        $mutex.Dispose()
+        throw "Another Tarkov CIS VPN operation is already running (mutex: $mutexName)."
+    }
+    $mutex
+}
+
+function Exit-ConnectorMutex {
+    param($Mutex)
+    if (-not $Mutex) { return }
+    try { $Mutex.ReleaseMutex() } catch {}
+    $Mutex.Dispose()
+}
+
+function Get-FailoverSecondsRemaining {
+    if (-not $script:FailoverDeadline) { return [double]::PositiveInfinity }
+    ([datetime]$script:FailoverDeadline - (Get-Date)).TotalSeconds
+}
+
+function Assert-FailoverTimeRemaining {
+    $remaining = Get-FailoverSecondsRemaining
+    if ($remaining -le 0) {
+        throw "CIS relay failover exceeded the $FailoverTimeoutSeconds-second total deadline."
+    }
+    $remaining
 }
 
 function Test-TcpQuick {
@@ -294,7 +399,26 @@ function Write-FailoverState {
     $State.KnownGood = @($State.KnownGood | Where-Object {
         try { [datetimeoffset]::Parse([string]$_.VerifiedAt) -gt [datetimeoffset]::Now.AddHours(-$KnownGoodLifetimeHours) } catch { $false }
     })
-    $State | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+    $json = $State | ConvertTo-Json -Depth 6
+    $tempPath = '{0}.{1}.tmp' -f $StatePath, ([guid]::NewGuid().ToString('N'))
+    $backupPath = '{0}.{1}.bak' -f $StatePath, ([guid]::NewGuid().ToString('N'))
+    try {
+        # Write beside the destination, then replace it in one filesystem
+        # operation. This prevents a reader from observing half-written JSON.
+        [IO.File]::WriteAllText(
+            $tempPath,
+            $json + [Environment]::NewLine,
+            [Text.UTF8Encoding]::new($false)
+        )
+        if ([IO.File]::Exists($StatePath)) {
+            [IO.File]::Replace($tempPath, $StatePath, $backupPath, $true)
+        } else {
+            [IO.File]::Move($tempPath, $StatePath)
+        }
+    } finally {
+        if ([IO.File]::Exists($tempPath)) { [IO.File]::Delete($tempPath) }
+        if ([IO.File]::Exists($backupPath)) { [IO.File]::Delete($backupPath) }
+    }
 }
 
 function Set-EndpointFailure {
@@ -367,10 +491,58 @@ function Add-KnownGoodCandidates {
     $result
 }
 
+function Get-RelayIdentity {
+    param([Parameter(Mandatory = $true)]$Server)
+    $ip = [string]$Server.IP
+    if ($ip) {
+        $parsed = $null
+        if ([Net.IPAddress]::TryParse($ip, [ref]$parsed)) {
+            return ('ip:{0}' -f $parsed.ToString())
+        }
+    }
+    $hostName = [string]$Server.HostName
+    if ($hostName) { return ('host:{0}' -f $hostName.Trim().ToLowerInvariant()) }
+    'endpoint:{0}' -f ([string]$Server.Endpoint).Trim().ToLowerInvariant()
+}
+
+function Sort-RelayEndpoints {
+    param([object[]]$Servers)
+    @($Servers | Sort-Object @{Expression = 'SourcePriority'; Descending = $true}, @{Expression = { if ($_.Sessions -gt 0) { 1 } else { 0 } }; Descending = $true}, @{Expression = 'Score'; Descending = $true}, @{Expression = 'Ping'; Descending = $false})
+}
+
+function Select-DiverseCountryCandidates {
+    param([object[]]$Servers, [int]$Limit)
+    $ordered = @(Sort-RelayEndpoints -Servers $Servers)
+    if (-not $ordered) { return @() }
+
+    # First pass takes one endpoint per relay/IP. The second pass is made only
+    # of alternate ports/hostnames for those relays, so a port fallback remains
+    # available without crowding out independent volunteers.
+    $primary = @()
+    $fallback = @()
+    $seenRelay = @{}
+    foreach ($server in $ordered) {
+        $relayKey = Get-RelayIdentity -Server $server
+        if (-not $seenRelay.ContainsKey($relayKey)) {
+            $seenRelay[$relayKey] = $true
+            $primary += $server
+        } else {
+            $fallback += $server
+        }
+    }
+    @($primary + $fallback | Select-Object -First $Limit)
+}
+
 function Select-RelayCandidates {
-    param([object[]]$Servers, $State)
+    param(
+        [object[]]$Servers,
+        $State,
+        [int]$PerCountryLimit = $MaxCandidatesPerCountry,
+        [int]$TotalLimit = $MaxCandidatesTotal,
+        [int]$CooldownMinutes = $FailureCooldownMinutes
+    )
     $cooling = @{}
-    $cutoff = [datetimeoffset]::Now.AddMinutes(-$FailureCooldownMinutes)
+    $cutoff = [datetimeoffset]::Now.AddMinutes(-$CooldownMinutes)
     foreach ($failure in @($State.Failures)) {
         try {
             $failedAt = [datetimeoffset]::Parse([string]$failure.FailedAt)
@@ -380,19 +552,44 @@ function Select-RelayCandidates {
 
     $eligible = @($Servers | Where-Object { -not $cooling.ContainsKey([string]$_.Endpoint) })
     $live = @($eligible | Where-Object Source -ne 'RecentKnownGood' | Group-Object CountryShort | ForEach-Object {
-        $_.Group |
-            Sort-Object @{Expression = 'SourcePriority'; Descending = $true}, @{Expression = { if ($_.Sessions -gt 0) { 1 } else { 0 } }; Descending = $true}, @{Expression = 'Score'; Descending = $true} |
-            Select-Object -First $MaxCandidatesPerCountry
+        Select-DiverseCountryCandidates -Servers @($_.Group) -Limit $PerCountryLimit
     })
     # Keep a small verified fallback pool even when a stale live snapshot has
     # enough higher-score entries to fill the per-country limit.
     $knownGood = @($eligible | Where-Object Source -eq 'RecentKnownGood' | Sort-Object VerifiedAt -Descending | Select-Object -First 3)
-    $selected = @(@($live) + @($knownGood) | Sort-Object @{Expression = 'Priority'; Descending = $true}, @{Expression = 'SourcePriority'; Descending = $true}, @{Expression = { if ($_.Sessions -gt 0) { 1 } else { 0 } }; Descending = $true}, @{Expression = 'Score'; Descending = $true} | Select-Object -First $MaxCandidatesTotal)
+    $ordered = @(@($live) + @($knownGood) | Sort-Object @{Expression = 'Priority'; Descending = $true}, @{Expression = 'SourcePriority'; Descending = $true}, @{Expression = { if ($_.Sessions -gt 0) { 1 } else { 0 } }; Descending = $true}, @{Expression = 'Score'; Descending = $true}, @{Expression = 'Ping'; Descending = $false})
+    $selected = @()
+    $selectedRelay = @{}
+    $fallbackEndpoints = @()
+    foreach ($server in $ordered) {
+        $relayKey = Get-RelayIdentity -Server $server
+        if (-not $selectedRelay.ContainsKey($relayKey)) {
+            $selectedRelay[$relayKey] = $true
+            $selected += $server
+        } else {
+            $fallbackEndpoints += $server
+        }
+        if ($selected.Count -ge $TotalLimit) { break }
+    }
+    if ($selected.Count -lt $TotalLimit) {
+        foreach ($server in $fallbackEndpoints) {
+            $selected += $server
+            if ($selected.Count -ge $TotalLimit) { break }
+        }
+    }
 
     [pscustomobject]@{
         Candidates = $selected
         Cooling = $cooling
     }
+}
+
+function Format-RelayCandidateTable {
+    param([object[]]$Candidates)
+    # Convert the complete formatting stream to text here. The background
+    # keeper consumes records one by one so raw FormatStartData/FormatEntryData
+    # objects cannot be rendered safely there in isolation.
+    (($Candidates | Format-Table CountryShort, Source, HostName, IP, Port, Ping, SpeedMbps, Sessions, Score -AutoSize | Out-String -Width 240).TrimEnd())
 }
 
 function Ensure-VpnAccount {
@@ -441,6 +638,10 @@ function Protect-PhysicalDefaultRoute {
 function Show-Status {
     $connected = Get-ConnectedVpnInfo
     $state = Read-FailoverState
+    $coolingCutoff = [datetimeoffset]::Now.AddMinutes(-$FailureCooldownMinutes)
+    $coolingCount = @($state.Failures | Where-Object {
+        try { [datetimeoffset]::Parse([string]$_.FailedAt) -gt $coolingCutoff } catch { $false }
+    }).Count
     [pscustomobject]@{
         Account = $AccountName
         Connected = [bool]$connected
@@ -449,7 +650,7 @@ function Show-Status {
         VpnInterface = if ($connected) { $connected.InterfaceAlias } else { $InterfaceAlias }
         VpnIPv4 = if ($connected) { $connected.IPv4 } else { $null }
         VpnGateway = if ($connected) { $connected.Gateway } else { $null }
-        CoolingEndpoints = @($state.Failures).Count
+        CoolingEndpoints = $coolingCount
         RecentKnownGood = @($state.KnownGood).Count
     } | Format-List
 
@@ -459,126 +660,170 @@ function Show-Status {
     }
 }
 
+if ($TestMode) { return }
+
 if ($Action -eq 'Status') {
     Show-Status
-    exit 0
+    return
 }
 
-if ($Action -eq 'Disconnect') {
-    Disconnect-VpnAccount
-    $state = Read-FailoverState
-    $state.Current = $null
-    Write-FailoverState -State $state
-    Write-Host "Disconnected $AccountName."
-    exit 0
+$connectorMutex = $null
+if ($Action -ne 'Candidates') {
+    $connectorMutex = Enter-ConnectorMutex
 }
 
-$state = Read-FailoverState
-$existingConnection = Get-ConnectedVpnInfo
-if ($Action -eq 'RememberCurrent') {
-    if (-not $existingConnection) { throw 'No verified SoftEther session is connected.' }
-    if (-not $RelayCountry -or -not $countryPriority.Contains($RelayCountry)) { throw 'RelayCountry must be a configured CIS country code such as RU or UA.' }
-    $endpoint = Get-ConfiguredAccountEndpoint
-    $remembered = [pscustomobject]@{
-        HostName = $endpoint.HostName
-        IP = $endpoint.IP
-        Port = $endpoint.Port
-        Endpoint = $endpoint.Endpoint
-        CountryShort = $RelayCountry
-    }
-    Set-EndpointSuccess -State $state -Server $remembered
-    $selectedDefault = Protect-PhysicalDefaultRoute -Vpn $existingConnection
-    Write-Host "Remembered verified $RelayCountry relay $($endpoint.Endpoint); default remains $($selectedDefault.InterfaceAlias)."
-    exit 0
-}
-if ($Action -eq 'Connect' -and $existingConnection) {
-    $selectedDefault = Protect-PhysicalDefaultRoute -Vpn $existingConnection
-    Write-Host "CIS relay is already connected; default remains $($selectedDefault.InterfaceAlias)."
-    exit 0
-}
-
-# If a relay that previously succeeded is now offline, quarantine it before
-# refreshing the list. This is what makes failover move to the next endpoint
-# instead of selecting the same high-score dead relay again.
-if ($state.Current -and -not $existingConnection) {
-    Set-EndpointFailure -State $state -Server $state.Current -Reason 'Previous VPN session is no longer established.'
-}
-
-$liveServers = @()
 try {
-    $liveServers = @(Get-CisServers)
-} catch {
-    Write-Warning "VPN Gate candidate discovery failed; trying only recently verified relays: $($_.Exception.Message)"
-}
-$servers = @(Add-KnownGoodCandidates -Servers $liveServers -State $state)
-if (-not $servers) { throw 'No live or recently verified TCP-capable CIS SoftEther relay is available.' }
-$selection = Select-RelayCandidates -Servers $servers -State $state
-$candidates = @($selection.Candidates)
-
-if ($Action -eq 'Candidates') {
-    $candidates | Format-Table CountryShort, Source, HostName, IP, Port, Ping, SpeedMbps, Sessions, Score -AutoSize
-    if (-not $candidates) { Write-Host 'All currently listed TCP-capable CIS relays are cooling down after recent failures.' }
-    exit 0
-}
-
-if (-not $candidates) {
-    $nextRetry = @($selection.Cooling.Values | Sort-Object | Select-Object -First 1)
-    if ($nextRetry) { throw "All currently listed CIS relays recently failed; next retry after $($nextRetry[0].ToString('o'))." }
-    throw 'No eligible CIS relay is available.'
-}
-
-Write-Host 'TCP-capable CIS VPN Gate candidates:'
-$candidates | Format-Table CountryShort, Source, HostName, IP, Port, Ping, SpeedMbps, Sessions, Score -AutoSize
-
-$attempted = 0
-foreach ($server in $candidates) {
-    $attempted++
-    Write-Host "Trying $($server.CountryShort) $($server.Endpoint)..."
-    if (-not (Test-TcpQuick -IPAddress $server.IP -Port $server.Port -TimeoutMs $TcpProbeTimeoutMilliseconds)) {
-        Set-EndpointFailure -State $state -Server $server -Reason 'Published TCP endpoint did not accept a connection.'
-        Write-Warning "Skipped unreachable relay $($server.Endpoint)."
-        continue
+    if ($Action -eq 'Connect') {
+        $script:FailoverDeadline = (Get-Date).AddSeconds([math]::Max(1, $FailoverTimeoutSeconds))
     }
 
+    if ($Action -eq 'Disconnect') {
+        Disconnect-VpnAccount
+        $state = Read-FailoverState
+        $state.Current = $null
+        Write-FailoverState -State $state
+        Write-Host "Disconnected $AccountName."
+        return
+    }
+
+    $state = Read-FailoverState
+    $existingConnection = Get-ConnectedVpnInfo
+    if ($Action -eq 'RememberCurrent') {
+        if (-not $existingConnection) { throw 'No verified SoftEther session is connected.' }
+        if (-not $RelayCountry -or -not $countryPriority.Contains($RelayCountry)) { throw 'RelayCountry must be a configured CIS country code such as RU or UA.' }
+        $endpoint = Get-ConfiguredAccountEndpoint
+        $remembered = [pscustomobject]@{
+            HostName = $endpoint.HostName
+            IP = $endpoint.IP
+            Port = $endpoint.Port
+            Endpoint = $endpoint.Endpoint
+            CountryShort = $RelayCountry
+        }
+        Set-EndpointSuccess -State $state -Server $remembered
+        $selectedDefault = Protect-PhysicalDefaultRoute -Vpn $existingConnection
+        Write-Host "Remembered verified $RelayCountry relay $($endpoint.Endpoint); default remains $($selectedDefault.InterfaceAlias)."
+        return
+    }
+    if ($Action -eq 'Connect' -and $existingConnection) {
+        $selectedDefault = Protect-PhysicalDefaultRoute -Vpn $existingConnection
+        Write-Host "CIS relay is already connected; default remains $($selectedDefault.InterfaceAlias)."
+        return
+    }
+
+    # Candidates is deliberately read-only: an offline Current entry is not
+    # quarantined while a user is merely inspecting the list.
+    if ($Action -ne 'Candidates' -and $state.Current -and -not $existingConnection) {
+        Set-EndpointFailure -State $state -Server $state.Current -Reason 'Previous VPN session is no longer established.'
+    }
+
+    $liveServers = @()
+    try {
+        $liveServers = @(Get-CisServers)
+    } catch {
+        Write-Warning "VPN Gate candidate discovery failed; trying only recently verified relays: $($_.Exception.Message)"
+    }
+    $servers = @(Add-KnownGoodCandidates -Servers $liveServers -State $state)
+    if (-not $servers) { throw 'No live or recently verified TCP-capable CIS SoftEther relay is available.' }
+    $selection = Select-RelayCandidates -Servers $servers -State $state
+    $candidates = @($selection.Candidates)
+
+    if ($Action -eq 'Candidates') {
+        Write-Output (Format-RelayCandidateTable -Candidates $candidates)
+        if (-not $candidates) { Write-Host 'All currently listed TCP-capable CIS relays are cooling down after recent failures.' }
+        return
+    }
+
+    if (-not $candidates) {
+        $nextRetry = @($selection.Cooling.Values | Sort-Object | Select-Object -First 1)
+        if ($nextRetry) { throw "All currently listed CIS relays recently failed; next retry after $($nextRetry[0].ToString('o'))." }
+        throw 'No eligible CIS relay is available.'
+    }
+
+    Write-Host "TCP-capable CIS VPN Gate candidates (total deadline: $FailoverTimeoutSeconds second(s)):"
+    Write-Output (Format-RelayCandidateTable -Candidates $candidates)
+
+    $attempted = 0
+    foreach ($server in $candidates) {
+        [void](Assert-FailoverTimeRemaining)
+        $attempted++
+        Write-Host "Trying $($server.CountryShort) $($server.Endpoint)..."
+        $remaining = Get-FailoverSecondsRemaining
+        $probeTimeout = [int][math]::Max(1, [math]::Min($TcpProbeTimeoutMilliseconds, [math]::Ceiling($remaining * 1000)))
+        if (-not (Test-TcpQuick -IPAddress $server.IP -Port $server.Port -TimeoutMs $probeTimeout)) {
+            Set-EndpointFailure -State $state -Server $server -Reason 'Published TCP endpoint did not accept a connection.'
+            Write-Warning "Skipped unreachable relay $($server.Endpoint)."
+            continue
+        }
+
+        [void](Assert-FailoverTimeRemaining)
+        Disconnect-VpnAccount
+        $resourceBusyAttempts = 0
+        $accountConnectStarted = $false
+        while (-not $accountConnectStarted) {
+            [void](Assert-FailoverTimeRemaining)
+            try {
+                Ensure-VpnAccount -Server $server
+                Invoke-VpnCmd -Arguments @('AccountConnect', $AccountName) | Out-Null
+                $accountConnectStarted = $true
+            } catch {
+                if (Test-SoftEtherResourceBusyError -ErrorRecord $_) {
+                    if ($resourceBusyAttempts -ge $ResourceBusyRetryCount) {
+                        throw "SoftEther reported local resource busy (exit code 43) for $($server.Endpoint) after $ResourceBusyRetryCount retry/retries; no relay was cooled down."
+                    }
+                    $resourceBusyAttempts++
+                    Write-Warning "SoftEther local session resources are still busy (exit code 43); waiting before retry $resourceBusyAttempts/$ResourceBusyRetryCount for $($server.Endpoint)."
+                    $waitSeconds = [int][math]::Max(1, [math]::Min($DisconnectWaitSeconds, [math]::Ceiling((Get-FailoverSecondsRemaining))))
+                    if (-not (Wait-SoftEtherOffline -TimeoutSeconds $waitSeconds)) {
+                        throw "SoftEther local session resources did not release after exit code 43; no relay was cooled down."
+                    }
+                    Start-Sleep -Milliseconds 500
+                    continue
+                }
+                Set-EndpointFailure -State $state -Server $server -Reason $_.Exception.Message
+                Write-Warning "SoftEther could not start $($server.Endpoint): $($_.Exception.Message)"
+                break
+            }
+        }
+        if (-not $accountConnectStarted) { continue }
+
+        [void](Assert-FailoverTimeRemaining)
+        $vpn = $null
+        $remaining = Get-FailoverSecondsRemaining
+        $deadline = (Get-Date).AddSeconds([math]::Min($ConnectTimeoutSeconds, $remaining))
+        do {
+            Start-Sleep -Milliseconds 500
+            $vpn = Get-ConnectedVpnInfo
+            if ($vpn) { break }
+        } while ((Get-Date) -lt $deadline -and (Get-FailoverSecondsRemaining) -gt 0)
+
+        if (-not $vpn) {
+            $remaining = Get-FailoverSecondsRemaining
+            $cleanupWait = [int][math]::Max(1, [math]::Min($DisconnectWaitSeconds, [math]::Ceiling([math]::Max(1, $remaining))))
+            Disconnect-VpnAccount -TimeoutSeconds $cleanupWait
+            Set-EndpointFailure -State $state -Server $server -Reason 'SoftEther handshake or IPv4 lease timed out.'
+            Write-Warning "Relay $($server.Endpoint) failed the VPN session check; moving to the next candidate."
+            continue
+        }
+
+        try {
+            $selectedDefault = Protect-PhysicalDefaultRoute -Vpn $vpn
+        } catch {
+            Disconnect-VpnAccount
+            Set-EndpointFailure -State $state -Server $server -Reason $_.Exception.Message
+            throw
+        }
+
+        Set-EndpointSuccess -State $state -Server $server
+        Write-Host "Connected CIS relay $($server.CountryShort) $($server.Endpoint)."
+        Write-Host "VPN interface $($vpn.InterfaceIndex) $($vpn.InterfaceAlias), IPv4 $($vpn.IPv4), gateway $($vpn.Gateway)."
+        Write-Host "Default route remains $($selectedDefault.InterfaceAlias) via $($selectedDefault.NextHop)."
+        return
+    }
+
+    # Do not leave a half-connected account behind after exhausting the list.
     Disconnect-VpnAccount
-    try {
-        Ensure-VpnAccount -Server $server
-        Invoke-VpnCmd -Arguments @('AccountConnect', $AccountName) | Out-Null
-    } catch {
-        Set-EndpointFailure -State $state -Server $server -Reason $_.Exception.Message
-        Write-Warning "SoftEther could not start $($server.Endpoint): $($_.Exception.Message)"
-        continue
-    }
-
-    $vpn = $null
-    $deadline = (Get-Date).AddSeconds($ConnectTimeoutSeconds)
-    do {
-        Start-Sleep -Milliseconds 500
-        $vpn = Get-ConnectedVpnInfo
-        if ($vpn) { break }
-    } while ((Get-Date) -lt $deadline)
-
-    if (-not $vpn) {
-        Disconnect-VpnAccount
-        Set-EndpointFailure -State $state -Server $server -Reason 'SoftEther handshake or IPv4 lease timed out.'
-        Write-Warning "Relay $($server.Endpoint) failed the VPN session check; moving to the next candidate."
-        continue
-    }
-
-    try {
-        $selectedDefault = Protect-PhysicalDefaultRoute -Vpn $vpn
-    } catch {
-        Disconnect-VpnAccount
-        Set-EndpointFailure -State $state -Server $server -Reason $_.Exception.Message
-        throw
-    }
-
-    Set-EndpointSuccess -State $state -Server $server
-    Write-Host "Connected CIS relay $($server.CountryShort) $($server.Endpoint)."
-    Write-Host "VPN interface $($vpn.InterfaceIndex) $($vpn.InterfaceAlias), IPv4 $($vpn.IPv4), gateway $($vpn.Gateway)."
-    Write-Host "Default route remains $($selectedDefault.InterfaceAlias) via $($selectedDefault.NextHop)."
-    exit 0
+    throw "Tried $attempted CIS relay candidate(s); none established a verified SoftEther session and IPv4 lease before the $FailoverTimeoutSeconds-second deadline. Failed remote endpoints are cooling down; local resource-busy failures were not recorded."
+} finally {
+    $script:FailoverDeadline = $null
+    Exit-ConnectorMutex -Mutex $connectorMutex
 }
-
-Disconnect-VpnAccount
-throw "Tried $attempted CIS relay candidate(s); none established a verified SoftEther session and IPv4 lease. Failed endpoints are cooling down before reuse."
