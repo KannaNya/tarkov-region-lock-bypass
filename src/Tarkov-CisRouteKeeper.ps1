@@ -27,7 +27,8 @@ function Read-Config {
         TaskName = $defaultTaskName
         VpnInterfaceAlias = 'VPN - VPN Client'
         RefreshSeconds = 30
-        ReconnectSeconds = 60
+        FailedCycleRetrySeconds = 10
+        DisconnectedPollSeconds = 5
         GameLogRoots = @()
         TargetHosts = $defaultHosts
         RaidTargets = @()
@@ -44,7 +45,8 @@ $config = Read-Config
 $taskName = [string]$config.TaskName
 $vpnAlias = [string]$config.VpnInterfaceAlias
 $effectiveRefreshSeconds = if ($PSBoundParameters.ContainsKey('RefreshSeconds')) { $RefreshSeconds } else { [int]$config.RefreshSeconds }
-$effectiveReconnectSeconds = [math]::Max(30, [int]$config.ReconnectSeconds)
+$effectiveFailedCycleRetrySeconds = [math]::Max(5, [int]$config.FailedCycleRetrySeconds)
+$effectiveDisconnectedPollSeconds = [math]::Max(1, [int]$config.DisconnectedPollSeconds)
 
 function Write-Log {
     param([AllowEmptyString()][string]$Message)
@@ -79,7 +81,15 @@ function Assert-Administrator {
 function Get-VpnInfo {
     $adapter = Get-NetAdapter -InterfaceAlias $vpnAlias -ErrorAction SilentlyContinue
     if (-not $adapter -or $adapter.Status -ne 'Up') { return $null }
-    $ipConfig = Get-NetIPConfiguration -InterfaceIndex $adapter.ifIndex
+    # SoftEther removes and recreates its IP interface while changing relays.
+    # The adapter can therefore disappear between these two queries.  That is
+    # a normal disconnected sample, not a keeper-wide failure.
+    try {
+        $ipConfig = Get-NetIPConfiguration -InterfaceIndex $adapter.ifIndex -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    if (-not $ipConfig) { return $null }
     # An APIPA lease can remain briefly after SoftEther disconnects.  Treating
     # it as a usable VPN address creates a false "connected" state and leaves
     # route reconciliation running against a dead adapter.
@@ -143,6 +153,12 @@ function Write-ConnectorStream {
     foreach ($line in @($rendered.Lines)) {
         Write-Log ("connector[{0}] {1}" -f $rendered.Stream, $line)
     }
+}
+
+function Get-KeeperLoopSleepSeconds {
+    param([bool]$VpnAvailable)
+    if ($VpnAvailable) { return [int]$effectiveRefreshSeconds }
+    [int][math]::Min($effectiveRefreshSeconds, $effectiveDisconnectedPollSeconds)
 }
 
 function Get-ObservedHosts {
@@ -220,7 +236,7 @@ function Remove-StateRoutes {
     foreach ($route in @($saved.OriginalDefaults)) {
         Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex ([int]$saved.VpnInterfaceIndex) -ErrorAction SilentlyContinue |
             Where-Object NextHop -eq $route.NextHop |
-            Set-NetRoute -RouteMetric ([int]$route.RouteMetric) -PolicyStore ActiveStore
+            Set-NetRoute -RouteMetric ([int]$route.RouteMetric) -PolicyStore ActiveStore -ErrorAction SilentlyContinue
     }
     Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
 }
@@ -354,9 +370,10 @@ $mutex = [Threading.Mutex]::new($true, 'Global\Tarkov-CisRouteKeeper', [ref]$cre
 if (-not $created) { exit 0 }
 Set-Content -LiteralPath $pidPath -Value $PID -Encoding ascii
 Write-Log "Keeper started as PID $PID."
-$lastConnectAttempt = [datetime]::MinValue
+$nextConnectAttempt = [datetime]::MinValue
 try {
     while ($true) {
+        $vpnAvailable = $false
         try {
             $vpn = Get-VpnInfo
             if ($vpn -and -not (Test-SoftEtherSession)) {
@@ -365,21 +382,40 @@ try {
             }
             if (-not $vpn) {
                 if (Test-Path -LiteralPath $statePath) { Remove-StateRoutes; Write-Log 'VPN disconnected; managed routes removed.' }
-                if ((Get-Date) - $lastConnectAttempt -gt [TimeSpan]::FromSeconds($effectiveReconnectSeconds) -and (Test-Path -LiteralPath $connectorPath)) {
-                    $lastConnectAttempt = Get-Date
+                if ((Get-Date) -ge $nextConnectAttempt -and (Test-Path -LiteralPath $connectorPath)) {
                     Write-Log 'VPN unavailable; refreshing VPN Gate and trying the next CIS relay candidate.'
                     # Redirect every PowerShell stream into the success stream
                     # and log each record/line with its stream type.  This keeps
                     # warnings, verbose diagnostics and connector errors visible
                     # in the long-running task log.
-                    & $connectorPath -Action Connect -InterfaceAlias $vpnAlias *>&1 |
-                        ForEach-Object { Write-ConnectorStream -Record $_ }
+                    try {
+                        & $connectorPath -Action Connect -InterfaceAlias $vpnAlias *>&1 |
+                            ForEach-Object { Write-ConnectorStream -Record $_ }
+                    } catch {
+                        Write-Log "Connector cycle failed: $($_.Exception.Message)"
+                    }
+
+                    # Re-read both the SoftEther SID and the lease immediately.
+                    # A successful connector must restore authorization routes
+                    # now rather than waiting for the normal connected refresh.
+                    $vpn = Get-VpnInfo
+                    if ($vpn -and (Test-SoftEtherSession)) {
+                        Sync-Routes -Vpn $vpn -Targets (Resolve-Targets)
+                        $vpnAvailable = $true
+                        $nextConnectAttempt = [datetime]::MinValue
+                        Write-Log 'Relay failover completed; authorization routes were restored immediately.'
+                    } else {
+                        $nextConnectAttempt = (Get-Date).AddSeconds($effectiveFailedCycleRetrySeconds)
+                        Write-Log "No relay connected; refreshing the candidate list again in $effectiveFailedCycleRetrySeconds second(s)."
+                    }
                 }
             } else {
                 Sync-Routes -Vpn $vpn -Targets (Resolve-Targets)
+                $vpnAvailable = $true
+                $nextConnectAttempt = [datetime]::MinValue
             }
         } catch { Write-Log "Sync error: $($_.Exception.Message)" }
-        Start-Sleep -Seconds $effectiveRefreshSeconds
+        Start-Sleep -Seconds (Get-KeeperLoopSleepSeconds -VpnAvailable $vpnAvailable)
     }
 } finally {
     Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue

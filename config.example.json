@@ -2,7 +2,8 @@
   "TaskName": "Tarkov-CIS-RouteKeeper",
   "VpnInterfaceAlias": "VPN - VPN Client",
   "RefreshSeconds": 30,
-  "ReconnectSeconds": 60,
+  "FailedCycleRetrySeconds": 10,
+  "DisconnectedPollSeconds": 5,
   "GameLogRoots": [
     "C:\\Games\\EscapeFromTarkov\\Logs"
   ],
