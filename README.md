@@ -83,6 +83,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 首次连接时，脚本会优先尝试原生目录中的俄罗斯 SoftEther 节点；如果俄罗斯节点没有响应，就会继续尝试乌克兰及其他配置中的 CIS 节点。安装常驻任务后，即使当前 VPN 断开，任务也会自动执行同样的故障转移流程，不需要每次手动加入服务器。
 
+掉线期间后台每 5 秒检查一次状态；一整批候选都失败时，10 秒后会重新读取最新节点目录，而不是继续等待旧列表。单个节点必须同时完成 SoftEther 会话和 IPv4 租约才算连接成功，成功后鉴权路由会立即恢复。可在 `config.json` 中用 `DisconnectedPollSeconds` 和 `FailedCycleRetrySeconds` 调整前两个间隔。
+
 ## 日常管理
 
 ```powershell

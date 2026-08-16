@@ -22,6 +22,7 @@ $functionNames = @(
     'Get-StreamRecordType',
     'Get-StreamRecordLines',
     'Write-ConnectorStream',
+    'Get-KeeperLoopSleepSeconds',
     'Resolve-Targets'
 )
 foreach ($functionName in $functionNames) {
@@ -36,6 +37,7 @@ foreach ($functionName in $functionNames) {
 Assert-Test ($source -match '(?m)\*>&1') 'Keeper does not redirect all connector streams.'
 Assert-Test ($source -match '\$logMaxBytes') 'Keeper does not configure a bounded log.'
 Assert-Test ($source -match 'HostNames') 'Keeper does not preserve shared-IP hostname relationships.'
+Assert-Test ($source -match 'FailedCycleRetrySeconds') 'Keeper does not define a short retry after an exhausted relay batch.'
 
 # Resolve-Targets must collapse route entries by IP while retaining every host
 # that points at the shared address.
@@ -50,6 +52,8 @@ function Resolve-DnsName {
 }
 $config = [ordered]@{ TargetHosts = @(); GameLogRoots = @() }
 $defaultHosts = @()
+$effectiveRefreshSeconds = 30
+$effectiveDisconnectedPollSeconds = 5
 $logPath = Join-Path ([IO.Path]::GetTempPath()) ('route-keeper-test-{0}.log' -f [guid]::NewGuid().ToString('N'))
 $logMaxBytes = 1024 * 1024
 $targets = @(Resolve-Targets)
@@ -87,6 +91,8 @@ $vpn = Get-VpnInfo
 Assert-Test ($vpn.IPv4 -eq '10.255.0.23') 'Get-VpnInfo did not skip the stale APIPA address.'
 $script:testVpnMode = 'apipa'
 Assert-Test ($null -eq (Get-VpnInfo)) 'Get-VpnInfo accepted an APIPA-only lease.'
+Assert-Test ((Get-KeeperLoopSleepSeconds -VpnAvailable $true) -eq 30) 'Connected keeper polling interval changed unexpectedly.'
+Assert-Test ((Get-KeeperLoopSleepSeconds -VpnAvailable $false) -eq 5) 'Disconnected keeper does not poll at the fast interval.'
 
 # Every redirected stream type should be rendered with a recognizable label.
 $streamCases = @(

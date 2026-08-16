@@ -5,7 +5,7 @@
     [string]$VpnCmdPath = 'C:\Program Files\SoftEther VPN Client\vpncmd_x64.exe',
     [string]$InterfaceAlias = 'VPN - VPN Client',
     [string]$NicName = 'VPN',
-    [int]$ConnectTimeoutSeconds = 25,
+    [int]$ConnectTimeoutSeconds = 18,
     [int]$FailoverTimeoutSeconds = 180,
     [int]$DisconnectWaitSeconds = 15,
     [int]$ResourceBusyRetryCount = 2,
@@ -75,7 +75,12 @@ function Test-EstablishedSoftEtherSessionOutput {
 function Get-VpnLease {
     $adapter = Get-NetAdapter -InterfaceAlias $InterfaceAlias -ErrorAction SilentlyContinue
     if (-not $adapter -or $adapter.Status -ne 'Up') { return $null }
-    $ipConfig = Get-NetIPConfiguration -InterfaceIndex $adapter.ifIndex -ErrorAction SilentlyContinue
+    try {
+        $ipConfig = Get-NetIPConfiguration -InterfaceIndex $adapter.ifIndex -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    if (-not $ipConfig) { return $null }
     $ip = $ipConfig.IPv4Address.IPAddress | Where-Object { $_ -and $_ -notlike '169.254.*' -and $_ -ne '0.0.0.0' } | Select-Object -First 1
     $gateway = $ipConfig.IPv4DefaultGateway.NextHop | Select-Object -First 1
     if (-not $ip -or -not $gateway) { return $null }
@@ -95,7 +100,11 @@ function Get-ConnectedVpnInfo {
 function Test-VpnAdapterReleased {
     $adapter = Get-NetAdapter -InterfaceAlias $InterfaceAlias -ErrorAction SilentlyContinue
     if (-not $adapter) { return $true }
-    $ipConfig = Get-NetIPConfiguration -InterfaceIndex $adapter.ifIndex -ErrorAction SilentlyContinue
+    try {
+        $ipConfig = Get-NetIPConfiguration -InterfaceIndex $adapter.ifIndex -ErrorAction Stop
+    } catch {
+        return $true
+    }
     if (-not $ipConfig) { return $true }
     $hasAddress = @($ipConfig.IPv4Address | Where-Object {
         $_.IPAddress -and $_.IPAddress -notlike '169.254.*' -and $_.IPAddress -ne '0.0.0.0'
@@ -615,16 +624,25 @@ function Ensure-VpnAccount {
 function Protect-PhysicalDefaultRoute {
     param($Vpn)
     Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $Vpn.InterfaceIndex -ErrorAction SilentlyContinue |
-        Set-NetRoute -RouteMetric 9000 -PolicyStore ActiveStore
+        Set-NetRoute -RouteMetric 9000 -PolicyStore ActiveStore -ErrorAction SilentlyContinue
 
     $rankedDefaults = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
         Where-Object State -eq 'Alive' |
         ForEach-Object {
             $route = $_
-            $ipInterface = Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue | Select-Object -First 1
-            [pscustomobject]@{
-                Route = $route
-                EffectiveMetric = [int]$route.RouteMetric + [int]$ipInterface.InterfaceMetric
+            $ipInterface = $null
+            try {
+                $ipInterface = Get-NetIPInterface -AddressFamily IPv4 -InterfaceIndex $route.InterfaceIndex -ErrorAction Stop | Select-Object -First 1
+            } catch {
+                # A virtual interface may vanish while the route snapshot is
+                # being enumerated. Skip that stale route and rank the live
+                # physical defaults that remain.
+            }
+            if ($ipInterface) {
+                [pscustomobject]@{
+                    Route = $route
+                    EffectiveMetric = [int]$route.RouteMetric + [int]$ipInterface.InterfaceMetric
+                }
             }
         } | Sort-Object EffectiveMetric)
     if (-not $rankedDefaults) { throw 'No live IPv4 default route remains.' }
