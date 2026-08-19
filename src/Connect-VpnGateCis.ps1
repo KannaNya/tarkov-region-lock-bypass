@@ -14,6 +14,8 @@
     [int]$TcpProbeTimeoutMilliseconds = 1500,
     [int]$DiscoveryTimeoutSeconds = 15,
     [int]$FailureCooldownMinutes = 15,
+    [int]$CoolingFallbackMinutes = 2,
+    [int]$CoolingFallbackCandidates = 3,
     [int]$KnownGoodLifetimeHours = 48,
     [string]$NativeCatalogPath,
     [int]$NativeCatalogMaxAgeHours = 24,
@@ -593,6 +595,91 @@ function Select-RelayCandidates {
     }
 }
 
+function Select-CoolingFallbackCandidates {
+    param(
+        [object[]]$Servers,
+        $State,
+        [int]$Limit = $CoolingFallbackCandidates,
+        [int]$MinimumAgeMinutes = $CoolingFallbackMinutes
+    )
+
+    if ($Limit -le 0) { return @() }
+    $now = [datetimeoffset]::Now
+    $minimumAge = $now.AddMinutes(-[math]::Max(0, $MinimumAgeMinutes))
+    $failures = @{}
+    foreach ($failure in @($State.Failures)) {
+        $endpoint = [string]$failure.Endpoint
+        if (-not $endpoint) { continue }
+        try {
+            $failedAt = [datetimeoffset]::Parse([string]$failure.FailedAt)
+            if (-not $failures.ContainsKey($endpoint) -or $failedAt -gt $failures[$endpoint]) {
+                $failures[$endpoint] = $failedAt
+            }
+        } catch {}
+    }
+
+    # If the complete live pool is quarantined, retry only the oldest failures
+    # after a short grace period.  This breaks the apparent 15-minute deadlock
+    # without immediately hammering every endpoint on every keeper poll.
+    $ranked = @($Servers | ForEach-Object {
+        $endpoint = [string]$_.Endpoint
+        if ($failures.ContainsKey($endpoint) -and $failures[$endpoint] -le $minimumAge) {
+            [pscustomobject]@{
+                Server = $_
+                FailedAt = $failures[$endpoint]
+            }
+        }
+    } | Sort-Object @{Expression = 'FailedAt'; Descending = $false},
+        @{Expression = { [int]$_.Server.Priority }; Descending = $true},
+        @{Expression = { [int]$_.Server.SourcePriority }; Descending = $true},
+        @{Expression = { [int64]$_.Server.Score }; Descending = $true},
+        @{Expression = { [int]$_.Server.Ping }; Descending = $false})
+
+    $selected = @()
+    $fallback = @()
+    $seenRelay = @{}
+    foreach ($entry in $ranked) {
+        $relayKey = Get-RelayIdentity -Server $entry.Server
+        if (-not $seenRelay.ContainsKey($relayKey)) {
+            $seenRelay[$relayKey] = $true
+            $selected += $entry.Server
+        } else {
+            $fallback += $entry.Server
+        }
+        if ($selected.Count -ge $Limit) { break }
+    }
+    if ($selected.Count -lt $Limit) {
+        foreach ($server in $fallback) {
+            $selected += $server
+            if ($selected.Count -ge $Limit) { break }
+        }
+    }
+    @($selected)
+}
+
+function Get-CoolingFallbackRetryAt {
+    param(
+        [object[]]$Servers,
+        $State,
+        [int]$MinimumAgeMinutes = $CoolingFallbackMinutes
+    )
+
+    $present = @{}
+    foreach ($server in @($Servers)) {
+        $endpoint = [string]$server.Endpoint
+        if ($endpoint) { $present[$endpoint] = $true }
+    }
+    $next = $null
+    foreach ($failure in @($State.Failures)) {
+        if ($present.Count -gt 0 -and -not $present.ContainsKey([string]$failure.Endpoint)) { continue }
+        try {
+            $retryAt = [datetimeoffset]::Parse([string]$failure.FailedAt).AddMinutes([math]::Max(0, $MinimumAgeMinutes))
+            if ($null -eq $next -or $retryAt -lt $next) { $next = $retryAt }
+        } catch {}
+    }
+    $next
+}
+
 function Format-RelayCandidateTable {
     param([object[]]$Candidates)
     # Convert the complete formatting stream to text here. The background
@@ -752,8 +839,15 @@ try {
     }
 
     if (-not $candidates) {
-        $nextRetry = @($selection.Cooling.Values | Sort-Object | Select-Object -First 1)
-        if ($nextRetry) { throw "All currently listed CIS relays recently failed; next retry after $($nextRetry[0].ToString('o'))." }
+        $candidates = @(Select-CoolingFallbackCandidates -Servers $servers -State $state)
+        if ($candidates) {
+            Write-Warning "All current CIS relays are in normal cooldown; retrying the oldest $($candidates.Count) relay candidate(s) after the controlled fallback grace period."
+        }
+    }
+
+    if (-not $candidates) {
+        $nextRetry = Get-CoolingFallbackRetryAt -Servers $servers -State $state
+        if ($nextRetry) { throw "All currently listed CIS relays recently failed; controlled fallback retry after $($nextRetry.ToString('o'))." }
         throw 'No eligible CIS relay is available.'
     }
 

@@ -47,6 +47,32 @@ $selection = Select-RelayCandidates -Servers $servers -State $state -PerCountryL
 Assert-Test (-not (@($selection.Candidates).Endpoint -contains '192.0.2.10:443')) 'Cooling endpoint was selected.'
 Assert-Test (@($selection.Candidates).Endpoint -contains '192.0.2.10:992') 'Alternate port should remain eligible.'
 
+# When every currently listed endpoint is cooling, the connector must not
+# deadlock for the full 15-minute quarantine.  After the short grace period it
+# should rotate the oldest failed relays in a bounded fallback batch.
+$oldFailure = (Get-Date).AddMinutes(-3).ToString('o')
+$state.Failures = @(
+    [pscustomobject]@{ Endpoint='192.0.2.10:443'; FailedAt=$oldFailure },
+    [pscustomobject]@{ Endpoint='192.0.2.10:992'; FailedAt=$oldFailure },
+    [pscustomobject]@{ Endpoint='192.0.2.11:443'; FailedAt=$oldFailure },
+    [pscustomobject]@{ Endpoint='192.0.2.12:443'; FailedAt=$oldFailure },
+    [pscustomobject]@{ Endpoint='192.0.2.13:443'; FailedAt=$oldFailure }
+)
+$selection = Select-RelayCandidates -Servers $servers -State $state -PerCountryLimit 5 -TotalLimit 5 -CooldownMinutes 15
+Assert-Test (@($selection.Candidates).Count -eq 0) 'All-cooling fixture unexpectedly produced regular candidates.'
+$fallback = @(Select-CoolingFallbackCandidates -Servers $servers -State $state -Limit 3 -MinimumAgeMinutes 2)
+Assert-Test ($fallback.Count -eq 3) "Expected three bounded cooling fallback candidates, got $($fallback.Count)."
+Assert-Test ($fallback[0].IP -eq '192.0.2.10' -and $fallback[1].IP -eq '192.0.2.11' -and $fallback[2].IP -eq '192.0.2.12') 'Cooling fallback did not rotate independent relays first.'
+$futureFailure = (Get-Date).AddSeconds(-30).ToString('o')
+$state.Failures = @([pscustomobject]@{ Endpoint='192.0.2.10:443'; FailedAt=$futureFailure })
+$fallback = @(Select-CoolingFallbackCandidates -Servers $servers -State $state -Limit 3 -MinimumAgeMinutes 2)
+Assert-Test ($fallback.Count -eq 0) 'Cooling fallback ignored its grace period.'
+$retryAt = Get-CoolingFallbackRetryAt -Servers $servers -State $state -MinimumAgeMinutes 2
+Assert-Test ($retryAt -gt (Get-Date)) 'Cooling fallback retry time was not in the future.'
+$state.Failures += [pscustomobject]@{ Endpoint='198.51.100.200:443'; FailedAt=(Get-Date).AddMinutes(-10).ToString('o') }
+$filteredRetryAt = Get-CoolingFallbackRetryAt -Servers $servers -State $state -MinimumAgeMinutes 2
+Assert-Test ($filteredRetryAt -eq $retryAt) 'Cooling fallback retry time included an endpoint outside the current catalog.'
+
 try {
     $state = New-FailoverState
     $state.Current = [pscustomobject]@{ Endpoint='192.0.2.99:443' }
