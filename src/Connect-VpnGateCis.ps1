@@ -544,6 +544,34 @@ function Select-DiverseCountryCandidates {
     @($primary + $fallback | Select-Object -First $Limit)
 }
 
+function Select-CountryDiverseCandidates {
+    param(
+        [object[]]$Servers,
+        [int]$PerCountryLimit
+    )
+
+    if ($PerCountryLimit -le 0) { return @() }
+    $groups = @($Servers | Group-Object CountryShort | ForEach-Object {
+        [pscustomobject]@{
+            Country = [string]$_.Name
+            Candidates = @(Select-DiverseCountryCandidates -Servers @($_.Group) -Limit $PerCountryLimit)
+        }
+    } | Sort-Object @{Expression = { [int]$countryPriority[[string]$_.Country] }; Descending = $true},
+        @{Expression = 'Country'; Descending = $false})
+
+    # Round-robin the best candidate from each CIS country before taking a
+    # second candidate from any one country.  A large RU listing must not starve
+    # a currently healthy UA/KZ/BY relay that is visible in the same snapshot.
+    $result = @()
+    for ($round = 0; $round -lt $PerCountryLimit; $round++) {
+        foreach ($group in $groups) {
+            $countryCandidates = @($group.Candidates)
+            if ($round -lt $countryCandidates.Count) { $result += $countryCandidates[$round] }
+        }
+    }
+    @($result)
+}
+
 function Select-RelayCandidates {
     param(
         [object[]]$Servers,
@@ -562,13 +590,20 @@ function Select-RelayCandidates {
     }
 
     $eligible = @($Servers | Where-Object { -not $cooling.ContainsKey([string]$_.Endpoint) })
-    $live = @($eligible | Where-Object Source -ne 'RecentKnownGood' | Group-Object CountryShort | ForEach-Object {
-        Select-DiverseCountryCandidates -Servers @($_.Group) -Limit $PerCountryLimit
+    $live = @($eligible | Where-Object Source -ne 'RecentKnownGood')
+    # Keep a small verified fallback pool per country even when a stale live
+    # snapshot omits a country that still has a recently verified relay.
+    $knownGood = @($eligible | Where-Object Source -eq 'RecentKnownGood' | Group-Object CountryShort | ForEach-Object {
+        $_.Group | Sort-Object VerifiedAt -Descending | Select-Object -First 3
     })
-    # Keep a small verified fallback pool even when a stale live snapshot has
-    # enough higher-score entries to fill the per-country limit.
-    $knownGood = @($eligible | Where-Object Source -eq 'RecentKnownGood' | Sort-Object VerifiedAt -Descending | Select-Object -First 3)
-    $ordered = @(@($live) + @($knownGood) | Sort-Object @{Expression = 'Priority'; Descending = $true}, @{Expression = 'SourcePriority'; Descending = $true}, @{Expression = { if ($_.Sessions -gt 0) { 1 } else { 0 } }; Descending = $true}, @{Expression = 'Score'; Descending = $true}, @{Expression = 'Ping'; Descending = $false})
+    # Combine live and known-good entries before the country-diversity pass.
+    # Otherwise a known-good UA relay can still be placed after every RU live
+    # entry and never be reached within the failover deadline.
+    $candidatePool = @($live) + @($knownGood)
+    $ordered = @(Select-CountryDiverseCandidates -Servers $candidatePool -PerCountryLimit $PerCountryLimit)
+    # $ordered is already country-diverse and score-ordered within each country.
+    # Do not apply a global country-priority sort here or the diversity pass
+    # would be undone before the total candidate limit is applied.
     $selected = @()
     $selectedRelay = @{}
     $fallbackEndpoints = @()

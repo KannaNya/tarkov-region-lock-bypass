@@ -42,6 +42,29 @@ Assert-Test ($chosen[3].IP -eq '192.0.2.13' -and $chosen[4].IP -eq '192.0.2.10' 
 $candidateText = Format-RelayCandidateTable -Candidates $chosen
 Assert-Test ($candidateText -match '192\.0\.2\.10' -and $candidateText -match '192\.0\.2\.13') 'Candidate table was not rendered as a complete text record.'
 
+# A high-volume RU listing must not starve a healthy UA relay.  The first
+# candidate still follows the configured RU priority, but the next independent
+# candidate must come from another CIS country before RU is filled further.
+$diverseServers = @(
+    [pscustomobject]@{ CountryShort='RU'; HostName='ru-primary.opengw.net'; IP='192.0.2.20'; Port=443; Endpoint='192.0.2.20:443'; Priority=100; Score=900; Ping=30; Sessions=2; Source='NativeCatalog'; SourcePriority=3 },
+    [pscustomobject]@{ CountryShort='RU'; HostName='ru-secondary.opengw.net'; IP='192.0.2.21'; Port=443; Endpoint='192.0.2.21:443'; Priority=100; Score=890; Ping=31; Sessions=2; Source='NativeCatalog'; SourcePriority=3 },
+    [pscustomobject]@{ CountryShort='UA'; HostName='ua-healthy.opengw.net'; IP='192.0.2.22'; Port=5555; Endpoint='192.0.2.22:5555'; Priority=95; Score=1200; Ping=15; Sessions=34; Source='NativeCatalog'; SourcePriority=3 }
+)
+$diverseSelection = Select-RelayCandidates -Servers $diverseServers -State (New-FailoverState) -PerCountryLimit 5 -TotalLimit 3 -CooldownMinutes 15
+$diverseChosen = @($diverseSelection.Candidates)
+Assert-Test ($diverseChosen.Count -eq 3) 'Country-diverse fixture did not produce three candidates.'
+Assert-Test ($diverseChosen[0].CountryShort -eq 'RU' -and $diverseChosen[1].CountryShort -eq 'UA' -and $diverseChosen[2].CountryShort -eq 'RU') 'A healthy UA relay was starved behind the RU candidate batch.'
+
+$knownGoodDiverseServers = @(
+    [pscustomobject]@{ CountryShort='RU'; HostName='ru-live.opengw.net'; IP='192.0.2.30'; Port=443; Endpoint='192.0.2.30:443'; Priority=100; Score=900; Ping=30; Sessions=2; Source='NativeCatalog'; SourcePriority=3 },
+    [pscustomobject]@{ CountryShort='RU'; HostName='ru-live-2.opengw.net'; IP='192.0.2.31'; Port=443; Endpoint='192.0.2.31:443'; Priority=100; Score=890; Ping=31; Sessions=2; Source='NativeCatalog'; SourcePriority=3 },
+    [pscustomobject]@{ CountryShort='UA'; HostName='ua-known-good.opengw.net'; IP='192.0.2.32'; Port=5555; Endpoint='192.0.2.32:5555'; Priority=95; Score=0; Ping=9999; Sessions=0; Source='RecentKnownGood'; SourcePriority=0; VerifiedAt=(Get-Date).ToString('o') }
+)
+$knownGoodSelection = Select-RelayCandidates -Servers $knownGoodDiverseServers -State (New-FailoverState) -PerCountryLimit 5 -TotalLimit 3 -CooldownMinutes 15
+$knownGoodChosen = @($knownGoodSelection.Candidates)
+Assert-Test ($knownGoodChosen.Count -eq 3) 'Known-good country fixture did not produce three candidates.'
+Assert-Test ($knownGoodChosen[0].CountryShort -eq 'RU' -and $knownGoodChosen[1].CountryShort -eq 'UA') 'A recently verified UA relay was still placed behind all live RU entries.'
+
 $state.Failures = @([pscustomobject]@{ Endpoint='192.0.2.10:443'; FailedAt=(Get-Date).ToString('o') })
 $selection = Select-RelayCandidates -Servers $servers -State $state -PerCountryLimit 5 -TotalLimit 5 -CooldownMinutes 15
 Assert-Test (-not (@($selection.Candidates).Endpoint -contains '192.0.2.10:443')) 'Cooling endpoint was selected.'
