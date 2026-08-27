@@ -10,6 +10,17 @@ config.json
 *.local.json
 .env
 
+# Python development and packaged builds
+__pycache__/
+*.py[cod]
+.venv/
+.venv-build/
+build/
+dist/
+*.egg-info/
+.coverage
+.pytest_cache/
+
 # Windows/editor noise
 Thumbs.db
 Desktop.ini

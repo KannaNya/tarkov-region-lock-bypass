@@ -1,4 +1,4 @@
-name: PowerShell validation
+name: Windows validation
 
 on:
   push:
@@ -25,3 +25,46 @@ jobs:
           .\tests\connector-failover-check.ps1
           .\tests\gui-control-check.ps1
           .\tests\route-keeper-check.ps1
+
+  python:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+      - name: Install Python package
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check -e .
+      - name: Run Python unit tests
+        shell: pwsh
+        run: python -m unittest discover -s tests_py -v
+      - name: Compile Python sources
+        shell: pwsh
+        run: python -m compileall -q python packaging
+      - name: Build PyInstaller Windows bundle
+        shell: pwsh
+        run: ./scripts/build-python.ps1 -PythonVersion 3.13
+      - name: Verify packaged executable
+        shell: pwsh
+        run: |
+          $executable = Resolve-Path 'dist\TarkovCIS\TarkovCIS.exe' -ErrorAction Stop
+          & $executable.Path --help | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged executable smoke test failed with exit code $LASTEXITCODE."
+          }
+          if (-not (Test-Path -LiteralPath 'dist\TarkovCIS-Windows.zip' -PathType Leaf)) {
+            throw 'Packaged ZIP artifact was not created.'
+          }
+      - name: Upload Windows bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: TarkovCIS-Windows-Python313
+          path: dist/TarkovCIS-Windows.zip
+          if-no-files-found: error
+          compression-level: 0
