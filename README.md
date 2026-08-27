@@ -1,8 +1,12 @@
-# Tarkov 区域锁分流与 VPN Gate 自动故障转移
+# Tarkov 俄区/CIS 区域锁分流与 VPN Gate 自动故障转移
 
-这是一个面向 Windows 的 PowerShell 工具，用于帮助在日本网络环境中使用 CIS 区账号的 Escape from Tarkov 玩家，建立“最小化分流”连接：只把已观察到的登录、区域鉴权和相关后端目标送入 SoftEther VPN Gate 的 CIS 出口，普通日本网络、更新下载以及独立 Raid 服务器继续走日本本地网络。
+这是一个面向 Windows 的 PowerShell 工具，用于帮助在日本网络环境中使用 CIS/俄区账号的 Escape from Tarkov 玩家，排查并改善区域锁、地区鉴权和二次授权连接问题，建立“最小化分流”连接：只把已观察到的登录、区域鉴权和相关后端目标送入 SoftEther VPN Gate 的 CIS 出口，普通日本网络、更新下载以及独立 Raid 服务器继续走日本本地网络。
 
 项目不依赖 Python，也不使用网上流传的固定 Tarkov IP 清单。它会定期重新解析目标域名，并从近期 EFT 日志中发现 lobby/WSN 主机名；VPN Gate 中继失效时，会合并 SoftEther 原生节点目录与官方 HTTPS 列表，自动测试并切换到下一个可用的 CIS 候选节点。
+
+**关键词**：Escape from Tarkov（EFT）、Tarkov 俄区、CIS 区账号、区域锁/地区鉴权、二次授权、VPN Gate、SoftEther VPN、Windows PowerShell、最小化 split routing、自动换节点、VPN 故障转移、登录分流。
+
+> 本项目是连接与分流辅助工具，不承诺绕过 BSG 的账号限制、地区政策或封禁机制；请确认使用方式符合游戏及 VPN 服务条款。
 
 ## 适合哪些人
 
