@@ -11,6 +11,7 @@
 - 本地工作目录：`C:\Users\Violet\Documents\Codex\2026-08-08\escape-from-tarkov-cis-vpn-gate`
 - 当前本地分支：`codex/python-refactor`；其 HEAD 与远端 `master` 相同。
 - 运行日志、`config.json`、构建产物和本机状态均已被忽略，没有上传。
+- 本地 `.git/refs/codex/turn-diffs/...` 有 Codex 生成的失效内部 ref；`git fetch` 可能提示 `bad object`，不影响当前提交、远端 `master` 或 `git push`。不要为了处理它执行 reset 或删除项目文件。
 
 ## 用户目标
 
