@@ -52,7 +52,7 @@ class ConnectionPhase(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class Relay:
-    """One concrete TCP endpoint exposed by a VPN Gate volunteer relay."""
+    """One concrete SoftEther TCP or NAT traversal UDP endpoint."""
 
     host_name: str
     ip: str
@@ -66,11 +66,15 @@ class Relay:
     source: str = "HttpsApi"
     source_priority: int = 2
     verified_at: datetime | None = None
+    transport: str = "tcp"
 
     def __post_init__(self) -> None:
         canonical_ip = ip_address(self.ip.strip()).compressed
         if not 1 <= int(self.port) <= 65_535:
             raise ValueError(f"relay port is outside 1..65535: {self.port}")
+        transport = self.transport.strip().lower()
+        if transport not in {"tcp", "udp"}:
+            raise ValueError(f"unsupported relay transport: {self.transport}")
         country = self.country_short.strip().upper()
         if not country:
             raise ValueError("relay country_short cannot be empty")
@@ -79,6 +83,7 @@ class Relay:
         object.__setattr__(self, "host_name", self.host_name.strip() or canonical_ip)
         object.__setattr__(self, "ip", canonical_ip)
         object.__setattr__(self, "port", int(self.port))
+        object.__setattr__(self, "transport", transport)
         object.__setattr__(self, "country_short", country)
         object.__setattr__(self, "country_long", self.country_long.strip())
         object.__setattr__(self, "score", int(self.score))
@@ -90,7 +95,8 @@ class Relay:
     @property
     def endpoint(self) -> str:
         address = f"[{self.ip}]" if ":" in self.ip else self.ip
-        return f"{address}:{self.port}"
+        endpoint = f"{address}:{self.port}"
+        return f"udp://{endpoint}" if self.transport == "udp" else endpoint
 
     @property
     def identity(self) -> str:

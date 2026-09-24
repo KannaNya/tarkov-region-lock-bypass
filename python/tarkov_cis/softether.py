@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import socket
+import tempfile
 import time
 from typing import Any, Callable
 
@@ -192,9 +193,12 @@ class SoftEtherClient:
     def ensure_account(self, relay: Any, *, deadline: float | None = None) -> None:
         host = str(getattr(relay, "ip", "") or getattr(relay, "host_name", ""))
         port = int(getattr(relay, "port", 0))
+        transport = str(getattr(relay, "transport", "tcp"))
         if not host or not 1 <= port <= 65535:
-            raise ValueError("relay must provide a host/IP and TCP port")
-        server = f"/SERVER:{host}:{port}"
+            raise ValueError("relay must provide a host/IP and valid port")
+        if transport not in {"tcp", "udp"}:
+            raise ValueError("unsupported SoftEther transport")
+        server = f"/SERVER:{host}:{port if transport == 'tcp' else 0}"
         def remaining() -> float:
             if deadline is None:
                 return self.command_timeout
@@ -203,11 +207,12 @@ class SoftEtherClient:
                 raise SoftEtherError("failover deadline expired during account configuration")
             return min(self.command_timeout, value)
 
-        if self._account_exists(timeout=remaining()):
+        account_exists = self._account_exists(timeout=remaining())
+        if account_exists and transport == "tcp":
             self._vpncmd(
                 "AccountSet", self.account_name, server, "/HUB:VPNGATE", timeout=remaining()
             )
-        else:
+        elif not account_exists:
             self._vpncmd(
                 "AccountCreate",
                 self.account_name,
@@ -224,6 +229,46 @@ class SoftEtherClient:
                 "/TYPE:standard",
                 timeout=remaining(),
             )
+        # vpncmd has no switch for NAT-T. SoftEther's own exported connection
+        # setting exposes PortUDP; importing the edited setting is supported by
+        # the client and was verified against the installed Windows client.
+        # Also clear a prior UDP port when rotating back to TCP: AccountSet
+        # changes only Port and would otherwise keep using the old UDP relay.
+        if transport == "udp" or account_exists:
+            with tempfile.TemporaryDirectory(prefix="tarkov-cis-vpn-") as directory:
+                original = Path(directory) / "original.vpn"
+                updated = Path(directory) / "updated.vpn"
+                self._vpncmd(
+                    "AccountExport", self.account_name,
+                    f"/SAVEPATH:{original}", timeout=remaining(),
+                )
+                source = original.read_text(encoding="utf-8-sig")
+                match = re.search(r"(?m)^(\s*uint PortUDP )\d+\s*$", source)
+                if match is None:
+                    raise SoftEtherError("exported SoftEther account has no PortUDP field")
+                desired_udp = port if transport == "udp" else 0
+                changed = source
+                replacements = {"PortUDP": desired_udp}
+                if transport == "udp":
+                    replacements.update({"Hostname": host, "Port": 0})
+                for field, value in replacements.items():
+                    kind = "string" if field == "Hostname" else "uint"
+                    changed, count = re.subn(
+                        rf"(?m)^(\s*{kind} {field} )\S+",
+                        lambda item: item.group(1) + str(value),
+                        changed,
+                        count=1,
+                    )
+                    if count != 1:
+                        raise SoftEtherError(f"exported SoftEther account has no {field} field")
+                if changed != source:
+                    updated.write_text(changed, encoding="utf-8")
+                    self._vpncmd("AccountDelete", self.account_name, timeout=remaining())
+                    try:
+                        self._vpncmd("AccountImport", str(updated), timeout=remaining())
+                    except Exception:
+                        self._vpncmd("AccountImport", str(original), timeout=remaining())
+                        raise
         # The Python keeper owns relay rotation; disable SoftEther's unbounded
         # internal endpoint retries.
         self._vpncmd(

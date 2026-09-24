@@ -60,6 +60,9 @@ class ConfigTests(unittest.TestCase):
         config = AppConfig.load(ROOT / "config.example.json")
         self.assertEqual(config.task_name, "Tarkov-CIS-RouteKeeper")
         self.assertEqual(config.refresh_seconds, 30)
+        self.assertTrue(config.disconnect_at_menu)
+        self.assertEqual(config.failed_cycle_backoff_max_seconds, 10)
+        self.assertEqual(config.cooling_fallback_minutes, 0)
         self.assertIn("gw-pvp.escapefromtarkov.ru", config.target_hosts)
 
         extended = AppConfig.from_mapping({"TaskName": "Test", "RefreshSeconds": 7, "FutureOption": {"x": 1}})
@@ -154,6 +157,7 @@ remote 192.0.2.1 992 tcp
                 ("Fqdn", 2, ["vpn-test-ru.opengw.net", "vpn-test-jp.opengw.net"]),
                 ("IP", 2, ["192.0.2.10", "192.0.2.20"]),
                 ("SslPorts", 2, ["443 992 invalid 70000", "5555"]),
+                ("UdpPort", 0, [2061, 0]),
                 ("PingToJapan", 0, [88, 12]),
                 ("SpeedToJapan", 4, [52_000_000, 100_000_000]),
                 ("Score", 4, [900_001, 900_002]),
@@ -191,7 +195,7 @@ remote 192.0.2.1 992 tcp
                 self.assertTrue(catalog.signature_marker_present)
                 self.assertEqual(
                     [item.endpoint for item in catalog.relays],
-                    ["192.0.2.10:443", "192.0.2.10:992"],
+                    ["192.0.2.10:443", "192.0.2.10:992", "udp://192.0.2.10:2061"],
                 )
                 self.assertEqual(catalog.relays[0].source, "NativeCatalog")
 

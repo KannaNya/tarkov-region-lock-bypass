@@ -289,6 +289,24 @@ class NativeCatalogReader:
             score = int(_pack_value(inner, "Score", index, 0))
             sessions = max(0, int(_pack_value(inner, "NumClients", index, 0)))
             host_name = str(_pack_value(inner, "Fqdn", index, "")).strip() or str(parsed_ip)
+            udp_port = int(_pack_value(inner, "UdpPort", index, 0) or 0)
+            if 1 <= udp_port <= 65_535:
+                relays.append(
+                    Relay(
+                        host_name=host_name,
+                        ip=str(parsed_ip),
+                        port=udp_port,
+                        country_short=country,
+                        country_long=str(_pack_value(inner, "CountryFull", index, "")),
+                        score=score,
+                        ping=ping,
+                        speed_mbps=round(speed / 1_000_000, 1),
+                        sessions=sessions,
+                        source="NativeCatalog",
+                        source_priority=3,
+                        transport="udp",
+                    )
+                )
             for port in sorted(ports):
                 relays.append(
                     Relay(

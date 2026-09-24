@@ -83,6 +83,7 @@ class LiveCandidateProvider:
             source="RecentKnownGood",
             source_priority=0,
             verified_at=datetime.fromisoformat(str(verified)) if verified else None,
+            transport=str(item.get("transport", "tcp")),
         )
 
     @staticmethod
@@ -91,6 +92,7 @@ class LiveCandidateProvider:
             "host_name": relay.host_name,
             "ip": relay.ip,
             "port": relay.port,
+            "transport": relay.transport,
             "country_short": relay.country_short,
             "country_long": relay.country_long,
             "score": relay.score,
@@ -310,6 +312,7 @@ class LiveCandidateProvider:
             source="RecentKnownGood",
             source_priority=0,
             verified_at=now,
+            transport=relay.transport,
         )
         self._failures = [item for item in self._failures if item.endpoint != relay.endpoint]
         self._known_good = [

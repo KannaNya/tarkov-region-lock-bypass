@@ -10,7 +10,7 @@ import time
 from typing import Any, Callable, Iterable
 
 from .eft_logs import discover_authorization_hosts, resolve_authorization_targets
-from .game_phase import GamePhase, GamePhaseSnapshot, PlayProtectionActivated
+from .game_phase import GamePhase, GamePhaseSnapshot, LoginWindowClosed, PlayProtectionActivated
 from .models import ConnectionPhase
 from .process_runner import CommandError
 from .routing import RouteManager
@@ -26,6 +26,7 @@ class KeeperPhase(str, Enum):
     APPLYING_ROUTES = "applying_routes"
     READY = "ready"
     PLAY_PROTECTED = "play_protected"
+    LOGIN_COMPLETE = "login_complete"
     SWITCHING = "switching"
     RETRY_WAIT = "retry_wait"
     FAILED = "failed"
@@ -100,6 +101,7 @@ class KeeperService:
         self._health_switch = False
         self._active_relay = None
         self._last_game_phase = GamePhaseSnapshot()
+        self._login_closed_session: str | None = None
         self._explicit_cleanup = False
         # Guard individual adapter commands too: connect()/sync() may perform
         # several destructive operations after a slow preceding command.
@@ -271,10 +273,65 @@ class KeeperService:
         return snapshot
 
     def _check_play_protection(self) -> None:
-        if self._explicit_cleanup or not self._raid_protection_enabled():
+        if self._explicit_cleanup:
             return
-        if self._protect_active_raid(self._game_phase()):
+        snapshot = self._game_phase()
+        if self._disconnect_at_menu() and self._login_finished(snapshot):
+            raise LoginWindowClosed()
+        if self._protect_active_raid(snapshot):
             raise PlayProtectionActivated()
+
+    def _disconnect_at_menu(self) -> bool:
+        return bool(getattr(self.config, "disconnect_at_menu", False))
+
+    def _login_finished(self, snapshot: GamePhaseSnapshot) -> bool:
+        if snapshot.process_running is False:
+            self._login_closed_session = None
+            return False
+        if (self._login_closed_session not in (None, "current-game") and snapshot.session_id
+                and snapshot.session_id != self._login_closed_session):
+            self._login_closed_session = None
+        return self._login_closed_session is not None or snapshot.phase in {
+            GamePhase.MENU, GamePhase.POST_RAID, GamePhase.MATCHMAKING, GamePhase.RAID,
+        }
+
+    def _end_login(self, snapshot: GamePhaseSnapshot) -> bool:
+        if self._login_closed_session is not None:
+            return True
+        errors: list[str] = []
+        self._explicit_cleanup = True
+        try:
+            try:
+                self.routes.cleanup()
+            except Exception as exc:
+                errors.append(f"临时路由: {exc}")
+            try:
+                if not self.softether.disconnect(timeout=self._disconnect_timeout()):
+                    errors.append("SoftEther 会话未确认断开")
+            except Exception as exc:
+                errors.append(f"SoftEther: {exc}")
+        finally:
+            self._explicit_cleanup = False
+        if errors:
+            self._set_status(KeeperPhase.FAILED, "登录结束后的清理失败: " + "; ".join(errors),
+                             game_phase=snapshot.phase.value, game_evidence=snapshot.detail)
+            return False
+        if self.machine.phase is not ConnectionPhase.DISCONNECTED:
+            if self.machine.phase is not ConnectionPhase.DISCONNECTING:
+                self.machine.disconnect()
+            self.machine.disconnected()
+        self._last_verified_lease = None
+        self._active_relay = None
+        self._last_targets = ()
+        self._last_identity = None
+        self._health_failures = 0
+        self._session_failures = 0
+        self._health_switch = False
+        self._login_closed_session = snapshot.session_id or "current-game"
+        self._set_status(KeeperPhase.LOGIN_COMPLETE, "已进入游戏大厅/游玩阶段；鉴权路由已撤销，VPN 已断开",
+                         game_phase=snapshot.phase.value, game_evidence=snapshot.detail,
+                         play_protected=False, relay="", country="", vpn_ipv4="", target_count=0)
+        return True
 
     def _raid_protection_enabled(self) -> bool:
         return bool(getattr(self.config, "pause_during_raid", True))
@@ -419,6 +476,8 @@ class KeeperService:
 
         try:
             return self._run_cycle()
+        except LoginWindowClosed:
+            return self._end_login(self._game_phase())
         except PlayProtectionActivated:
             # This is a successful pause, not a relay failure.  In particular,
             # do not route it through reset()/disconnect() exception handlers.
@@ -428,6 +487,8 @@ class KeeperService:
 
         snapshot = self._game_phase()
         self._last_game_phase = snapshot
+        if self._disconnect_at_menu() and self._login_finished(snapshot):
+            return self._end_login(snapshot)
         if self._protect_active_raid(snapshot):
             # Do not call verified_connection(), DNS, HTTPS health probes,
             # route cleanup, disconnect(), or candidate discovery here.  The
@@ -585,7 +646,7 @@ class KeeperService:
                     max(0.1, float(getattr(self.config, "tcp_probe_timeout_milliseconds", 1500)) / 1000),
                     max(0.1, failover_deadline - time.monotonic()),
                 )
-                if not self.softether.probe_tcp(relay, timeout=probe_timeout):
+                if str(getattr(relay, "transport", "tcp")) != "udp" and not self.softether.probe_tcp(relay, timeout=probe_timeout):
                     if time.monotonic() >= failover_deadline:
                         raise _FailoverDeadlineExpired(
                             "本轮故障转移共享时限在 TCP 探测期间耗尽"
@@ -725,7 +786,11 @@ class KeeperService:
             if ready:
                 failed_cycles = 0
                 wait_seconds = int(getattr(self.config, "refresh_seconds", 30))
-            elif self.machine.phase is ConnectionPhase.READY:
+                if self._disconnect_at_menu() and self.status.phase in {
+                    KeeperPhase.READY, KeeperPhase.LOGIN_COMPLETE,
+                }:
+                    wait_seconds = min(wait_seconds, int(getattr(self.config, "disconnected_poll_seconds", 5)))
+            elif self.machine.phase is ConnectionPhase.READY and self.status.phase is not KeeperPhase.FAILED:
                 # A retained session is not a failed relay. Poll it at the
                 # normal interval so a transient probe/lease miss cannot cause
                 # a rapid disconnect/reconnect storm or NCSI browser popups.

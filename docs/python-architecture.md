@@ -18,11 +18,11 @@ relay_selector  process_runner  Windows ActiveStore
 
 - `models.py`：不可变数据模型，不执行系统命令。
 - `config.py`：读取并验证与旧版兼容的 `config.json`。
-- `catalog.py`：解析 VPN Gate 数据源，只产生明确 TCP 端口的 CIS 候选。
+- `catalog.py`：解析 VPN Gate 数据源，区分 SoftEther TCP 端口、UDP NAT-T 端口和不能混用的 OpenVPN UDP 端口。
 - `relay_selector.py`：国家轮询、端点去重、失败冷却和受控回退。
 - `state_machine.py`：限制连接阶段的合法转换，避免用散乱布尔变量表达状态。
 - `process_runner.py`：为所有外部命令统一提供超时、退出码和输出捕获。
-- `softether.py`：唯一允许调用 `vpncmd` 的模块；SID 与非 APIPA IPv4 租约同时存在才算成功。
+- `softether.py`：唯一允许调用 `vpncmd` 的模块；UDP NAT-T 使用 SoftEther 自身导出/导入连接设置的 `PortUDP` 字段；SID 与非 APIPA IPv4 租约同时存在才算成功。
 - `routing.py`：只管理本项目记录的目标 `/32` ActiveStore 路由，并把 VPN 默认路由 metric 提高到 9000。
 - `eft_logs.py`：只发现登录、lobby、WSN 和 gw-pvp 主机名；不把 Raid IP 自动加入 VPN。
 - `game_phase.py`：从 EFT 本地日志读取登录、选角色、匹配、Raid、PostRaid 标记；仅在游戏进程仍存在时启用匹配/Raid 保护锁。
@@ -42,7 +42,7 @@ relay_selector  process_runner  Windows ActiveStore
 7. 所有外部命令必须有超时，失败必须携带命令名、退出码与可审计信息。
 8. PID、操作 token、进程创建时间和随机 generation 必须共同匹配；旧世代状态只标记为 stale，不得伪装成当前 `READY`。
 9. 停止失败时保留所有权记录并保持单实例锁，直到工作线程结束；不得为了让界面显示“已停止”而与仍在执行的路由操作竞态。
-10. `MATCHMAKING` 和 `RAID` 阶段不得调用会话探测、健康探测、路由清理、SoftEther disconnect 或候选切换；收到 `UserMatchOver`/`PostRaid` 后才恢复。
+10. 默认登录专用模式在首次检测到大厅、匹配或 Raid 时撤销自有路由并断开 SoftEther，同一游戏会话内不再重连；旧的匹配/Raid 保持会话保护只在 `DisconnectAtMenu=false` 时启用。
 
 ## 发布方式
 

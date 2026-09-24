@@ -24,13 +24,13 @@
 
 ## 工作方式
 
-1. Python 目录读取器优先读取 SoftEther VPN Gate 插件已经缓存的 `VPNGate.dat`，从 `SslPorts` 取得准确的 SoftEther SSL/TCP 端口；它只确认文件格式和签名标记存在，不把这描述为密码学验签。
+1. Python 目录读取器使用 SoftEther VPN Gate 插件显示的同一份节点列表 `VPNGate.dat`，分别读取 SoftEther TCP 的 `SslPorts` 和 UDP NAT-T 的 `UdpPort`；它只确认文件格式和签名标记存在，不把这描述为密码学验签。
 2. 同时查询 VPN Gate 官方 HTTPS/OpenVPN 列表作为新鲜的第二数据源，再按 `RU → UA → 其他配置中的 CIS 候选` 排序并去重。
-3. 只接受明确声明了 TCP 端口的候选；原生目录中 `SslPorts` 为空的行，以及 OpenVPN 的 UDP-only 端口，都不会被误当成 SoftEther TCP 端口。
+3. 对明确声明 TCP 端口的节点使用 TCP；对插件列出的 UDP NAT-T 端口使用 SoftEther 自身的 UDP 穿透连接。OpenVPN UDP 端口不会被当成 SoftEther 端口。这样 `SslPorts` 为空但 `UdpPort` 有值的节点也能参与切换。
 4. 将候选节点写入 SoftEther 账户 `Tarkov-CIS-PlayOnly`，并关闭 SoftEther 自身的无限重试。只有 `SID-*` 会话、正常虚拟网卡、非 APIPA IPv4 和 VPN 网关同时存在才会报告连接成功。
 5. Python Keeper 由显式状态机驱动，常驻任务持续检查会话、网卡、IPv4 地址、临时路由和普通默认出口。
-6. 当前节点失效时，删除本工具管理的旧路由并尝试下一个；确认属于远端的失败通常会隔离 15 分钟，本机虚拟网卡尚未释放（SoftEther 错误 43）则只等待并有限重试，不会误伤候选节点。如果当前列表中的所有 CIS 节点同时进入隔离，连接器会在约 2 分钟的短暂宽限后轮换最旧的少量失败节点，避免整个候选池长时间“无可用节点”而看起来卡死。
-7. Keeper 会读取当前 EFT 日志中的真实阶段标记：登录和选角色阶段继续做鉴权检查；从 `TRACE-NetworkGameMatching`/`UserConfirmed` 开始进入匹配保护，`TRACE-NetworkGameCreate`、`GameStarted` 期间保持现有 SoftEther 会话和 `/32` 路由，不再健康探测、断开或切换节点；收到 `UserMatchOver`/`PostRaid` 后才恢复维护。这样 Raid 中不会因为后台换节点而把游戏踢掉。
+6. 当前节点失效时，删除本工具管理的旧路由并尝试下一个；一批候选均失败后每 10 秒刷新目录并重试，全部处于冷却期时每轮最多复测 3 个最早失败的独立中继。SoftEther 错误 43 属于本机资源忙，不会误伤远端候选节点。
+7. 默认 `DisconnectAtMenu=true`：Keeper 在登录和选角色期间维护鉴权分流；检测到游戏大厅、匹配或 Raid 阶段时，撤销本工具的 `/32` 路由并断开 SoftEther，当前游戏会话内不再重连。游戏退出或产生新的日志会话后才重新准备下次登录。若显式设为 `false`，才使用旧的匹配/Raid 保持会话保护模式。
 8. 一轮故障转移默认最多运行 180 秒，并优先尝试不同 IP 的独立中继；候选按 CIS 国家轮询，先保证 RU 后的 UA/KZ/BY 等国家各有机会，再补齐同一国家的其他节点；同一中继的其他 SSL 端口只作为后备，不会挤占全部候选名额。
 9. 目标域名解析出的地址使用临时 `/32` 路由走 VPN；VPN 默认路由提高 metric，因此日本物理网卡仍是普通流量的默认出口。
 
@@ -66,6 +66,8 @@ Windows 路由按目标 IP 选择，不能按 URL 路径或进程区分流量。
 
 关闭 GUI 不会停止后台任务。首次启动会根据 `config.example.json` 自动创建本机专用的 `config.json`；该文件已被 Git 忽略。静态鉴权域名可直接工作；若要增加基于本机证据的 WSN 动态发现，可把 `GameLogRoots` 填为实际 `EscapeFromTarkov\Logs` 目录后重新启动任务。
 
+进入大厅后的断开依赖本机 EFT 日志中的阶段标记；状态栏显示 `login_complete` 才表示后台已确认撤销路由并断开 VPN。公共 VPN Gate 候选全都不可达时，10 秒重试也不能保证建立连接。
+
 ## 命令行方式
 
 发布包中的 EXE：
@@ -91,7 +93,7 @@ py -3 .\Tarkov-CIS-Python.py stop
 
 直接使用命令行执行 `start`、`stop`、`uninstall` 或 `run` 时，请先打开“以管理员身份运行”的终端；图形界面会自行触发 UAC。`status` 和 `candidates` 保持只读。
 
-首次连接优先尝试原生目录中的俄罗斯节点；若俄罗斯节点没有完成 TCP、SID 和租约验证，会继续乌克兰及其他 CIS 国家。掉线后后台按配置刷新目录；一整批候选失败时，默认 10 秒后取新快照。若当前目录内所有 endpoint 都处于 15 分钟冷却，状态机会先等待 2 分钟宽限，再只放行最老的最多 3 个独立中继做受控复测，避免无限猛连或整池卡死。
+首次连接优先尝试 SoftEther 插件列表中的俄罗斯节点，支持 TCP 和 UDP NAT-T；若俄罗斯节点没有完成 SID 和租约验证，会继续乌克兰及其他 CIS 国家。掉线后后台按配置刷新目录；一整批候选失败时，默认 10 秒后取新快照。若当前目录内所有 endpoint 都处于 15 分钟冷却，每轮最多复测 3 个最早失败的独立中继。
 
 ## 日常管理
 

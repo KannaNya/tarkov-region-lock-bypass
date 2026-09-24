@@ -19,6 +19,7 @@ _FIELD_ALIASES = {
     "session_failure_threshold": "SessionFailureThreshold",
     "failed_cycle_backoff_max_seconds": "FailedCycleBackoffMaxSeconds",
     "pause_during_raid": "PauseDuringRaid",
+    "disconnect_at_menu": "DisconnectAtMenu",
     "game_phase_max_age_days": "GamePhaseMaxAgeDays",
     "game_phase_max_files": "GamePhaseMaxFiles",
     "game_phase_max_bytes_per_file": "GamePhaseMaxBytesPerFile",
@@ -113,10 +114,10 @@ class AppConfig:
     # probe.  These counters are intentionally consecutive-cycle thresholds.
     health_failure_threshold: int = 3
     session_failure_threshold: int = 3
-    failed_cycle_backoff_max_seconds: int = 120
-    # Login/character selection keep normal health checks. Matching and Raid
-    # freeze maintenance until a later menu/PostRaid marker or game exit.
+    failed_cycle_backoff_max_seconds: int = 10
+    # The legacy play guard is used only when disconnect_at_menu is disabled.
     pause_during_raid: bool = True
+    disconnect_at_menu: bool = True
     game_phase_max_age_days: int = 2
     game_phase_max_files: int = 24
     game_phase_max_bytes_per_file: int = 256 * 1024
@@ -137,7 +138,7 @@ class AppConfig:
     tcp_probe_timeout_milliseconds: int = 1500
     discovery_timeout_seconds: int = 15
     failure_cooldown_minutes: int = 15
-    cooling_fallback_minutes: int = 2
+    cooling_fallback_minutes: int = 0
     cooling_fallback_candidates: int = 3
     known_good_lifetime_hours: int = 48
     extras: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
@@ -212,6 +213,10 @@ class AppConfig:
         values["pause_during_raid"] = _bool(
             _read_value(data, "pause_during_raid", getattr(defaults, "pause_during_raid")),
             "pause_during_raid",
+        )
+        values["disconnect_at_menu"] = _bool(
+            _read_value(data, "disconnect_at_menu", getattr(defaults, "disconnect_at_menu")),
+            "disconnect_at_menu",
         )
         values["failed_cycle_retry_seconds"] = max(5, values["failed_cycle_retry_seconds"])
         values["disconnected_poll_seconds"] = max(1, values["disconnected_poll_seconds"])

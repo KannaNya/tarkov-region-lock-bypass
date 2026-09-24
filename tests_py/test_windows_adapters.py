@@ -103,6 +103,9 @@ class SoftEtherTests(unittest.TestCase):
             calls.append(tuple(argv))
             if "AccountList" in argv:
                 return result(argv, stdout="Tarkov-CIS-PlayOnly")
+            if "AccountExport" in argv:
+                path = next(value.split(":", 1)[1] for value in argv if value.startswith("/SAVEPATH:"))
+                Path(path).write_text("\tstring Hostname 31.43.129.131\n\tuint Port 5555\n\tuint PortUDP 0\n", encoding="utf-8")
             return result(argv)
 
         relay = SimpleNamespace(ip="31.43.129.131", host_name="vpn.example", port=5555)
@@ -112,6 +115,28 @@ class SoftEtherTests(unittest.TestCase):
         self.assertIn("/SERVER:31.43.129.131:5555", flat)
         self.assertIn("AccountRetrySet", flat)
         self.assertIn("/NUM:0", flat)
+
+    def test_udp_account_uses_softether_portudp_and_import(self):
+        calls = []
+        imported = []
+
+        def runner(argv, **_kwargs):
+            calls.append(tuple(argv))
+            if "AccountList" in argv:
+                return result(argv, stdout="Tarkov-CIS-PlayOnly")
+            if "AccountExport" in argv:
+                path = next(value.split(":", 1)[1] for value in argv if value.startswith("/SAVEPATH:"))
+                Path(path).write_text("\tstring Hostname old.example\n\tuint Port 443\n\tuint PortUDP 0\n", encoding="utf-8")
+            if "AccountImport" in argv:
+                imported.append(Path(argv[-1]).read_text(encoding="utf-8"))
+            return result(argv)
+
+        relay = SimpleNamespace(ip="109.126.32.153", port=2061, transport="udp")
+        SoftEtherClient(runner=runner).ensure_account(relay)
+        self.assertIn("uint PortUDP 2061", imported[0])
+        self.assertIn("string Hostname 109.126.32.153", imported[0])
+        self.assertIn("uint Port 0", imported[0])
+        self.assertTrue(any("AccountDelete" in call for call in calls))
 
     def test_exit_code_43_is_classified_as_local_resource_busy(self):
         def runner(argv, **_kwargs):

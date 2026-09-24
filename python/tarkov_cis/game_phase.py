@@ -35,6 +35,10 @@ class PlayProtectionActivated(RuntimeError):
     """Unwind maintenance without running failure cleanup during a Raid."""
 
 
+class LoginWindowClosed(PlayProtectionActivated):
+    """Stop in-flight VPN work when the game has left the login window."""
+
+
 @dataclass(frozen=True, slots=True)
 class GamePhaseSnapshot:
     phase: GamePhase = GamePhase.UNKNOWN

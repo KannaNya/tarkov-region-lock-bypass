@@ -223,6 +223,7 @@ class KeeperGameProtectionTests(unittest.TestCase):
         self.assertTrue(keeper.status.play_protected)
         self.assertEqual("raid", keeper.status.game_phase)
 
+
     def test_matching_also_freezes_relay_switching(self):
         softether = MagicMock()
         routes = MagicMock()
@@ -432,6 +433,75 @@ class KeeperGameProtectionTests(unittest.TestCase):
         self.assertTrue(keeper.run_cycle())
         self.assertEqual(ConnectionPhase.READY, keeper.machine.phase)
 
+
+class LoginOnlyTests(unittest.TestCase):
+    def service(self, snapshot):
+        self.snapshot = snapshot
+        self.softether = MagicMock()
+        self.softether.disconnect.return_value = True
+        self.routes = MagicMock()
+        self.provider = MagicMock(return_value=[])
+        self.keeper = KeeperService(
+            config=SimpleNamespace(disconnect_at_menu=True, pause_during_raid=True),
+            candidate_provider=self.provider, softether=self.softether,
+            routes=self.routes, game_phase_probe=lambda: self.snapshot,
+        )
+        return self.keeper
+
+    def test_menu_disconnects_once_and_keeps_vpn_off(self):
+        keeper = self.service(GamePhaseSnapshot(
+            phase=GamePhase.MENU, detail="MainMenu", process_running=True,
+            session_id="launch-a",
+        ))
+        keeper.machine.session_restored()
+        self.assertTrue(keeper.run_cycle())
+        self.assertEqual(ConnectionPhase.DISCONNECTED, keeper.machine.phase)
+        self.assertEqual(KeeperPhase.LOGIN_COMPLETE, keeper.status.phase)
+        self.routes.cleanup.assert_called_once()
+        self.softether.disconnect.assert_called_once()
+        self.provider.assert_not_called()
+        self.assertTrue(keeper.run_cycle())
+        self.softether.disconnect.assert_called_once()
+        self.snapshot = GamePhaseSnapshot(phase=GamePhase.RAID, process_running=True,
+                                          session_id="launch-a")
+        self.assertTrue(keeper.run_cycle())
+        self.provider.assert_not_called()
+
+    def test_menu_during_probe_aborts_connection_and_cleans_up(self):
+        keeper = self.service(LOGIN)
+        self.softether.verified_connection.return_value = None
+        self.provider.return_value = [RELAY]
+
+        def enter_menu(*_args, **_kwargs):
+            self.snapshot = GamePhaseSnapshot(phase=GamePhase.MENU,
+                                              process_running=True, session_id="launch-a")
+            return True
+
+        self.softether.probe_tcp.side_effect = enter_menu
+        self.assertTrue(keeper.run_cycle())
+        self.softether.connect.assert_not_called()
+        self.assertEqual(KeeperPhase.LOGIN_COMPLETE, keeper.status.phase)
+        self.assertEqual(ConnectionPhase.DISCONNECTED, keeper.machine.phase)
+
+    def test_game_exit_reopens_login_window(self):
+        keeper = self.service(GamePhaseSnapshot(phase=GamePhase.MENU,
+                                                process_running=True, session_id="launch-a"))
+        self.assertTrue(keeper.run_cycle())
+        self.snapshot = GamePhaseSnapshot(process_running=False, session_id="launch-a")
+        self.softether.verified_connection.return_value = None
+        self.assertFalse(keeper.run_cycle())
+        self.provider.assert_called_once()
+
+    def test_failed_menu_cleanup_retries_without_discovery(self):
+        keeper = self.service(GamePhaseSnapshot(phase=GamePhase.MENU,
+                                                process_running=True, session_id="launch-a"))
+        self.softether.disconnect.side_effect = [False, True]
+        self.assertFalse(keeper.run_cycle())
+        self.assertEqual(KeeperPhase.FAILED, keeper.status.phase)
+        self.provider.assert_not_called()
+        self.assertTrue(keeper.run_cycle())
+        self.assertEqual(KeeperPhase.LOGIN_COMPLETE, keeper.status.phase)
+        self.assertEqual(2, self.softether.disconnect.call_count)
 
 class AdapterPlayProtectionTests(unittest.TestCase):
     def test_connect_guard_stops_reconfiguration_between_adapter_commands(self):
