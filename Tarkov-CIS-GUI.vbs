@@ -57,25 +57,8 @@ Sub LaunchElevated(ByVal filePath, ByVal arguments)
     On Error GoTo 0
 End Sub
 
-' A packaged executable is the preferred path for users who do not have
-' Python installed.  The second location is the development build output.
-For Each candidate In Array( _
-    fileSystem.BuildPath(projectRoot, "TarkovCIS.exe"), _
-    fileSystem.BuildPath(projectRoot, "dist\TarkovCIS\TarkovCIS.exe"), _
-    fileSystem.BuildPath(projectRoot, "dist\TarkovCIS.exe") _
-)
-    If fileSystem.FileExists(candidate) Then
-        executablePath = candidate
-        Exit For
-    End If
-Next
-
-If Len(executablePath) > 0 Then
-    LaunchElevated executablePath, "gui --config " & QuoteArgument(configPath)
-    WScript.Quit 0
-End If
-
-' In a source checkout, prefer a windowless Python launcher.  Tarkov-CIS-
+' In a source checkout, prefer current source over an older local dist build.
+' Use a windowless Python launcher when available. Tarkov-CIS-
 ' Python.py adds the repository's python package directory to sys.path, so no
 ' global pip installation is required.
 sourceEntry = fileSystem.BuildPath(projectRoot, "Tarkov-CIS-Python.py")
@@ -103,6 +86,24 @@ If fileSystem.FileExists(sourceEntry) Then
         LaunchElevated pythonPath, QuoteArgument(sourceEntry) & " gui --config " & QuoteArgument(configPath)
         WScript.Quit 0
     End If
+End If
+
+' A release bundle has no source entry point.  In a source checkout without
+' Python, the packaged executable remains a usable fallback.
+For Each candidate In Array( _
+    fileSystem.BuildPath(projectRoot, "TarkovCIS.exe"), _
+    fileSystem.BuildPath(projectRoot, "dist\TarkovCIS\TarkovCIS.exe"), _
+    fileSystem.BuildPath(projectRoot, "dist\TarkovCIS.exe") _
+)
+    If fileSystem.FileExists(candidate) Then
+        executablePath = candidate
+        Exit For
+    End If
+Next
+
+If Len(executablePath) > 0 Then
+    LaunchElevated executablePath, "gui --config " & QuoteArgument(configPath)
+    WScript.Quit 0
 End If
 
 ' Compatibility fallback for an older checkout without a packaged executable

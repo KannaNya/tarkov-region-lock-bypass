@@ -23,6 +23,28 @@ from tarkov_cis.models import Relay
 
 
 class CliControlTests(unittest.TestCase):
+    def test_gui_launcher_prefers_source_over_stale_dist_executable(self):
+        cscript = shutil.which("cscript.exe")
+        if cscript is None:
+            self.skipTest("Windows Script Host is required for the launcher probe")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copy2(ROOT / "Tarkov-CIS-GUI.vbs", root / "Tarkov-CIS-GUI.vbs")
+            (root / "Tarkov-CIS-Python.py").touch()
+            stale_executable = root / "dist" / "TarkovCIS" / "TarkovCIS.exe"
+            stale_executable.parent.mkdir(parents=True)
+            stale_executable.touch()
+            result = subprocess.run(
+                [cscript, "//nologo", str(root / "Tarkov-CIS-GUI.vbs"), "/probe"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+            self.assertIn(str(root / "Tarkov-CIS-Python.py"), result.stdout)
+            self.assertNotIn(str(stale_executable), result.stdout)
+
     @patch("tarkov_cis.cli._invoke_task_action")
     @patch("tarkov_cis.cli._ensure_config", return_value=AppConfig())
     def test_start_is_a_task_install_not_a_foreground_run(self, _config, invoke):

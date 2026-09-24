@@ -151,6 +151,8 @@ def _format_status(value: Any) -> str:
             parts.append("旧状态已忽略")
         if value.get("connection_phase"):
             parts.append(str(value["connection_phase"]))
+        if value.get("detail"):
+            parts.append(str(value["detail"]))
         if value.get("game_phase"):
             phase = str(value["game_phase"])
             parts.append("Raid 保护中" if value.get("play_protected") else f"游戏阶段 {phase}")
@@ -181,7 +183,7 @@ class TarkovCisGui:
         container.pack(fill=tk.BOTH, expand=True)
 
         self.status_var = tk.StringVar(value="状态：正在读取后台状态")
-        ttk.Label(container, textvariable=self.status_var).pack(
+        ttk.Label(container, textvariable=self.status_var, wraplength=640, justify=tk.LEFT).pack(
             anchor=tk.W, pady=(0, 10)
         )
 
