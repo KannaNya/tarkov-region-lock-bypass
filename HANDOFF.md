@@ -6,7 +6,8 @@
 
 - GitHub：<https://github.com/KannaNya/tarkov-region-lock-bypass>
 - 默认分支：`master`
-- 已推送提交：`03f381eaabb76452e28f521db5718fa57bb434bd`
+- Raid 保护功能提交：`03f381eaabb76452e28f521db5718fa57bb434bd`
+- 交接文档最新提交：以远端 `master` 当前 HEAD 为准（本次文档提交之后会继续更新）。
 - 本地工作目录：`C:\Users\Violet\Documents\Codex\2026-08-08\escape-from-tarkov-cis-vpn-gate`
 - 当前本地分支：`codex/python-refactor`；其 HEAD 与远端 `master` 相同。
 - 运行日志、`config.json`、构建产物和本机状态均已被忽略，没有上传。
