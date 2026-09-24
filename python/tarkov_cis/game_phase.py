@@ -51,6 +51,7 @@ class GamePhaseSnapshot:
     raid_ip: str = ""
     raid_port: int = 0
     session_id: str = ""
+    raid_started_seen: bool = False
 
 
 _TIMESTAMP_RE = re.compile(
@@ -140,9 +141,13 @@ def _endpoint(line: str) -> tuple[str, int]:
 def _event(line: str) -> tuple[GamePhase, str, str, int] | None:
     """Classify one log line; return phase, safe detail, optional endpoint."""
 
+    # Untimestamped Unity stack frames often mention old phase method names.
+    # They are diagnostic text, not a new game transition.
+    if not _TIMESTAMP_RE.match(line):
+        return None
     lowered = line.lower()
     if "usermatchover" in lowered or "user match over" in lowered:
-        return GamePhase.MENU, "UserMatchOver：Raid 已结束", "", 0
+        return GamePhase.POST_RAID, "UserMatchOver：正在结算战局", "", 0
     if "showcharacterselectionscreen" in lowered:
         return GamePhase.CHARACTER_SELECT, "ShowCharacterSelectionScreen：等待选角色", "", 0
     if "showprofileloadingscreen" in lowered or "successful login" in lowered:
@@ -152,10 +157,10 @@ def _event(line: str) -> tuple[GamePhase, str, str, int] | None:
     if "userconfirmed" in lowered or "user confirmed" in lowered:
         ip, port = _endpoint(line)
         return GamePhase.RAID, "UserConfirmed：服务器已确认 Raid", ip, port
-    if "trace-networkgamecreate" in lowered or "tracenetworkgamecreate" in lowered or "networkgamesession.gamestarted" in lowered:
+    if "trace-networkgamecreate" in lowered or "tracenetworkgamecreate" in lowered:
         ip, port = _endpoint(line)
         return GamePhase.RAID, "NetworkGameCreate：Raid 会话已建立", ip, port
-    if _TIMESTAMP_RE.match(line) and re.search(r"\bgame\s*started\s*:", lowered):
+    if re.search(r"\bgame\s*started\s*:", lowered):
         ip, port = _endpoint(line)
         return GamePhase.RAID_STARTED, "GameStarted：已进入 Raid", ip, port
     if "postraid." in lowered or "gameoversavestatusreceived" in lowered:
@@ -228,6 +233,7 @@ def detect_game_phase(
     if not events:
         return GamePhaseSnapshot(process_running=process_running, session_id=session_id)
     latest_raid_endpoint = ("", 0)
+    raid_started_seen = any(event[3] is GamePhase.RAID_STARTED for event in events)
     for occurred, _, _, phase, detail, raid_ip, raid_port in sorted(events):
         if phase in {GamePhase.RAID, GamePhase.RAID_STARTED}:
             if raid_ip:
@@ -253,6 +259,7 @@ def detect_game_phase(
         raid_ip=raid_ip,
         raid_port=raid_port,
         session_id=session_id,
+        raid_started_seen=raid_started_seen,
     )
 
 

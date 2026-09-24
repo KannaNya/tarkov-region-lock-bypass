@@ -292,7 +292,8 @@ class KeeperService:
                 and snapshot.session_id != self._raid_direct_session):
             self._raid_direct_session = None
         return self._raid_direct_session is not None or (
-            snapshot.process_running is True and snapshot.phase is GamePhase.RAID_STARTED
+            snapshot.process_running is True
+            and (snapshot.phase is GamePhase.RAID_STARTED or snapshot.raid_started_seen)
         )
 
     def _enter_raid_direct(self, snapshot: GamePhaseSnapshot) -> bool:
@@ -339,7 +340,7 @@ class KeeperService:
     def _protect_active_raid(self, snapshot: GamePhaseSnapshot) -> bool:
         """Freeze reconciliation once matching has begun and during a Raid."""
 
-        protected_phases = {GamePhase.MATCHMAKING, GamePhase.RAID, GamePhase.RAID_STARTED}
+        protected_phases = {GamePhase.MATCHMAKING, GamePhase.RAID, GamePhase.RAID_STARTED, GamePhase.POST_RAID}
         if not self._raid_protection_enabled() or snapshot.phase not in protected_phases:
             return False
         # A stale marker from an old log must not freeze a fresh login.  The
@@ -492,9 +493,8 @@ class KeeperService:
         if self._protect_active_raid(snapshot):
             # Do not call verified_connection(), DNS, HTTPS health probes,
             # route cleanup, disconnect(), or candidate discovery here.  The
-            # current /32 routes and SoftEther session stay untouched from
-            # matching through Raid until UserMatchOver / PostRaid brings the
-            # next cycle safely back to the menu.
+            # current /32 routes and SoftEther session stay untouched through
+            # matching, Raid, and post-Raid settlement.
             return True
 
         skip_endpoint = ""

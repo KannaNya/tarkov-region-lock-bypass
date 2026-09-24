@@ -80,7 +80,18 @@ class GamePhaseDetectionTests(unittest.TestCase):
             "Got notification | UserMatchOver\n"
         )
         ended = detect_game_phase([self.tmp.name], process_checker=lambda: True)
-        self.assertEqual(GamePhase.MENU, ended.phase)
+        self.assertEqual(GamePhase.POST_RAID, ended.phase)
+
+    def test_game_started_survives_late_create_trace_and_match_over(self):
+        self._log(
+            "2026-09-24 22:00:00.000|Info|application|GameStarted:1\n"
+            "2026-09-24 22:00:01.000|Debug|application|TRACE-NetworkGameCreate 6\n"
+            "2026-09-24 22:01:00.000|Info|push-notifications|Got notification | UserMatchOver\n"
+            "EFT.NetworkGameSession:NetworkGameCreate()\n"
+        )
+        snapshot = detect_game_phase([self.tmp.name], process_checker=lambda: True)
+        self.assertEqual(GamePhase.POST_RAID, snapshot.phase)
+        self.assertTrue(snapshot.raid_started_seen)
 
     def test_user_confirmed_marker_is_already_inside_raid(self):
         self._log(
@@ -407,7 +418,7 @@ class KeeperGameProtectionTests(unittest.TestCase):
         self.assertTrue(keeper.run_cycle())
         self.softether.verified_connection.assert_not_called()
 
-    def test_post_raid_resumes_without_counting_pre_raid_failures(self):
+    def test_post_raid_keeps_connection_stable(self):
         keeper = self.service()
         keeper._health_failures = 2
         keeper._session_failures = 2
@@ -415,9 +426,9 @@ class KeeperGameProtectionTests(unittest.TestCase):
         keeper.run_cycle()
         self.snapshot = GamePhaseSnapshot(phase=GamePhase.POST_RAID, process_running=True)
         self.health.return_value = HealthResult(False, "timeout")
-        self.assertFalse(keeper.run_cycle())
-        self.assertEqual(1, keeper._health_failures)
-        self.softether.verified_connection.assert_called_once()
+        self.assertTrue(keeper.run_cycle())
+        self.assertEqual(0, keeper._health_failures)
+        self.softether.verified_connection.assert_not_called()
         self.softether.disconnect.assert_not_called()
 
     def test_exit_or_new_launch_releases_previous_raid_latch(self):
@@ -441,7 +452,7 @@ class KeeperGameProtectionTests(unittest.TestCase):
         self.assertTrue(keeper.run_cycle())
         self.softether.verified_connection.assert_called_once()
 
-    def test_post_raid_can_resume_a_suspended_connect_state(self):
+    def test_post_raid_preserves_a_suspended_connect_state(self):
         keeper = self.service()
         keeper.machine.start()
         keeper.machine.candidate_selected(RELAY)
@@ -450,7 +461,7 @@ class KeeperGameProtectionTests(unittest.TestCase):
         keeper.run_cycle()
         self.snapshot = GamePhaseSnapshot(phase=GamePhase.POST_RAID, process_running=True)
         self.assertTrue(keeper.run_cycle())
-        self.assertEqual(ConnectionPhase.READY, keeper.machine.phase)
+        self.assertEqual(ConnectionPhase.VERIFYING_SESSION, keeper.machine.phase)
 
 
 class RaidDisconnectTests(unittest.TestCase):
@@ -507,6 +518,17 @@ class RaidDisconnectTests(unittest.TestCase):
         self.routes.cleanup.assert_called_once()
         self.softether.disconnect.assert_called_once()
         self.assertTrue(keeper.run_cycle())
+        self.softether.disconnect.assert_called_once()
+        self.provider.assert_not_called()
+
+    def test_restart_after_raid_stays_direct_during_results(self):
+        keeper = self.service(GamePhaseSnapshot(
+            phase=GamePhase.POST_RAID, process_running=True,
+            session_id="launch-a", raid_started_seen=True,
+        ))
+        keeper.machine.session_restored()
+        self.assertTrue(keeper.run_cycle())
+        self.assertEqual(KeeperPhase.RAID_DIRECT, keeper.status.phase)
         self.softether.disconnect.assert_called_once()
         self.provider.assert_not_called()
 
