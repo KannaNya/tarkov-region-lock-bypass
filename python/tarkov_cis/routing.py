@@ -11,6 +11,7 @@ import time
 from typing import Callable, Iterable
 
 from .process_runner import CommandResult, run_command
+from .game_phase import PlayProtectionActivated
 from .softether import VpnLease, _powershell_quote
 
 
@@ -68,12 +69,14 @@ class RouteManager:
         command_timeout: float = 10.0,
         route_metric: int = 1,
         state_path: str | Path | None = None,
+        operation_guard: Callable[[], None] | None = None,
     ) -> None:
         if route_metric < 1:
             raise ValueError("route_metric must be positive")
         self.powershell = powershell
         self._run = runner
         self.command_timeout = command_timeout
+        self.operation_guard = operation_guard
         self.route_metric = route_metric
         self._managed: set[ManagedRoute] = set()
         local_app_data = Path(
@@ -162,6 +165,8 @@ class RouteManager:
         return min(self.command_timeout, max(0.1, remaining))
 
     def _powershell(self, script: str, *, deadline: float | None = None) -> CommandResult:
+        if self.operation_guard is not None:
+            self.operation_guard()
         return self._run(
             [self.powershell, "-NoProfile", "-NonInteractive", "-Command", script],
             timeout=self._bounded_timeout(deadline),
@@ -218,10 +223,24 @@ class RouteManager:
         gateway = _powershell_quote(route.gateway)
         script = (
             "$ErrorActionPreference='Stop';"
-            f"Get-NetRoute -PolicyStore ActiveStore -AddressFamily IPv4 "
+            f"$r=@(Get-NetRoute -PolicyStore ActiveStore -AddressFamily IPv4 "
             f"-DestinationPrefix {prefix} -InterfaceIndex {route.interface_index} "
-            f"-ErrorAction SilentlyContinue|Where-Object NextHop -eq {gateway}|"
-            "Remove-NetRoute -PolicyStore ActiveStore -Confirm:$false -ErrorAction Stop"
+            f"-ErrorAction SilentlyContinue|Where-Object NextHop -eq {gateway});"
+            # A disconnected SoftEther adapter removes its routes before the
+            # keeper gets a chance to clean up its ownership file.  Treat an
+            # exact route that is already absent as successful; if the same
+            # interface index is later reused, the exact gateway/prefix filter
+            # still prevents removing an unrelated route.
+            "if($r.Count -eq 0){exit 0};"
+            # SoftEther can remove the route between the exact read above and
+            # Remove-NetRoute.  Re-read the same prefix/interface/gateway
+            # after a removal error; an empty result is already the desired
+            # state and must not block failover or shutdown.
+            "try{$r|Remove-NetRoute -PolicyStore ActiveStore -Confirm:$false -ErrorAction Stop}"
+            "catch{$left=@(Get-NetRoute -PolicyStore ActiveStore -AddressFamily IPv4 "
+            f"-DestinationPrefix {prefix} -InterfaceIndex {route.interface_index} "
+            f"-ErrorAction SilentlyContinue|Where-Object NextHop -eq {gateway});"
+            "if($left.Count -eq 0){exit 0};throw $_}"
         )
         result = self._powershell(script, deadline=deadline)
         if not result.ok:
@@ -270,10 +289,14 @@ class RouteManager:
         next_hop = _powershell_quote(route.next_hop)
         script = (
             "$ErrorActionPreference='Stop';"
-            f"Get-NetRoute -PolicyStore ActiveStore -AddressFamily IPv4 "
+            f"$r=@(Get-NetRoute -PolicyStore ActiveStore -AddressFamily IPv4 "
             f"-DestinationPrefix '0.0.0.0/0' -InterfaceIndex {route.interface_index} "
-            f"-ErrorAction Stop|Where-Object NextHop -eq {next_hop}|"
-            f"Set-NetRoute -PolicyStore ActiveStore -RouteMetric {int(metric)} "
+            f"-ErrorAction SilentlyContinue|Where-Object NextHop -eq {next_hop});"
+            # The virtual adapter may already be gone.  There is then no
+            # default route to restore, and retaining the stale ownership entry
+            # would block the next discovery cycle forever.
+            "if($r.Count -eq 0){exit 0};"
+            f"$r|Set-NetRoute -PolicyStore ActiveStore -RouteMetric {int(metric)} "
             "-ErrorAction Stop"
         )
         result = self._powershell(script, deadline=deadline)
@@ -339,8 +362,7 @@ class RouteManager:
         identity = (int(lease.interface_index), str(ipaddress.IPv4Address(lease.gateway)))
 
         if not desired:
-            self.cleanup(deadline=deadline)
-            return self.managed
+            raise RouteError("empty DNS target set; existing routes retained; use cleanup explicitly")
 
         stale_identity = any(
             (route.interface_index, route.gateway) != identity for route in self._managed
@@ -365,6 +387,8 @@ class RouteManager:
         for route in tuple(self._managed):
             try:
                 self.remove_target(route, deadline=deadline)
+            except PlayProtectionActivated:
+                raise
             except Exception as exc:  # retain all cleanup attempts
                 errors.append(exc)
         for route in tuple(self._original_defaults):
@@ -372,6 +396,8 @@ class RouteManager:
                 self._set_default_metric(route, route.route_metric, deadline=deadline)
                 self._original_defaults.discard(route)
                 self._save_state()
+            except PlayProtectionActivated:
+                raise
             except Exception as exc:
                 errors.append(exc)
         if errors:

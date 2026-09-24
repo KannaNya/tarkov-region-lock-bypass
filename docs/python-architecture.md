@@ -11,9 +11,9 @@ tarkov_cis.cli / tarkov_cis.gui
           /       |       \
    catalog    softether   routing
       |           |          |
- relay_selector  process_runner  Windows ActiveStore
+relay_selector  process_runner  Windows ActiveStore
       |
- state_machine + models + config
+ state_machine + models + config + game_phase
 ```
 
 - `models.py`：不可变数据模型，不执行系统命令。
@@ -25,10 +25,11 @@ tarkov_cis.cli / tarkov_cis.gui
 - `softether.py`：唯一允许调用 `vpncmd` 的模块；SID 与非 APIPA IPv4 租约同时存在才算成功。
 - `routing.py`：只管理本项目记录的目标 `/32` ActiveStore 路由，并把 VPN 默认路由 metric 提高到 9000。
 - `eft_logs.py`：只发现登录、lobby、WSN 和 gw-pvp 主机名；不把 Raid IP 自动加入 VPN。
+- `game_phase.py`：从 EFT 本地日志读取登录、选角色、匹配、Raid、PostRaid 标记；仅在游戏进程仍存在时启用匹配/Raid 保护锁。
 - `keeper.py`：由 `ConnectionStateMachine` 驱动连接、验证、路由同步、健康检查和节点切换。
 - `gui.py`：最小 Tkinter 控制面，只调用后台任务控制回调；关闭窗口不会停止 Keeper。
 - `cli.py`：配置、只读状态、KnownGood/失败状态与 CLI 编排。
-- `scripts/python-task.ps1`：唯一保留的系统包装层，负责 UAC 和计划任务生命周期，不实现候选或路由算法。
+- `scripts/python-task.ps1`：只负责 UAC、迁移和计划任务控制；它注册的常驻任务动作直接执行 Python `run`，自身不作为长期 Keeper 进程。
 
 ## 安全不变量
 
@@ -41,6 +42,7 @@ tarkov_cis.cli / tarkov_cis.gui
 7. 所有外部命令必须有超时，失败必须携带命令名、退出码与可审计信息。
 8. PID、操作 token、进程创建时间和随机 generation 必须共同匹配；旧世代状态只标记为 stale，不得伪装成当前 `READY`。
 9. 停止失败时保留所有权记录并保持单实例锁，直到工作线程结束；不得为了让界面显示“已停止”而与仍在执行的路由操作竞态。
+10. `MATCHMAKING` 和 `RAID` 阶段不得调用会话探测、健康探测、路由清理、SoftEther disconnect 或候选切换；收到 `UserMatchOver`/`PostRaid` 后才恢复。
 
 ## 发布方式
 

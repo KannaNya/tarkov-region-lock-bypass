@@ -312,7 +312,10 @@ class KeeperTests(unittest.TestCase):
             def connect(self, relay, **_kwargs):
                 self.attempts.append(relay)
                 if relay is first:
-                    raise SoftEtherError("handshake timeout")
+                    # vpncmd timeouts are local command errors, but they still
+                    # belong to this relay attempt and must not abort the
+                    # whole candidate batch.
+                    raise CommandTimeout("vpncmd timed out", result())
                 return VpnLease(12, "VPN", "10.1.0.2", "10.1.0.1")
 
             def disconnect(self, **_kwargs):

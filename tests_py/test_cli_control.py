@@ -281,7 +281,7 @@ class CliControlTests(unittest.TestCase):
         self.assertIn("Test-TaskUsesThisWrapper", script)
         self.assertIn("Get-PythonWrapperPath", script)
         self.assertIn("System32\\WindowsPowerShell\\v1.0\\powershell.exe", script)
-        self.assertIn("Migrating the Python keeper from", script)
+        self.assertIn("Migrating the Python keeper", script)
         self.assertIn("shared PID/token cleanup", script)
         self.assertIn("Get-LegacyKeeperPath", script)
         self.assertIn("refusing to overwrite it", script)
@@ -304,7 +304,8 @@ foreach ($name in @(
     'ConvertTo-SafeWindowsArgument',
     'Join-SafeWindowsArguments',
     'Get-PythonWrapperPath',
-    'Test-TaskUsesThisWrapper'
+    'Test-TaskUsesThisWrapper',
+    'Test-TaskUsesDirectPythonRuntime'
 )) {
     $node = $ast.Find({
         param($candidate)
@@ -315,6 +316,7 @@ foreach ($name in @(
     Invoke-Expression $node.Extent.Text
 }
 $currentWrapperPath = 'C:\Release-B\scripts\python-task.ps1'
+$projectRoot = 'C:\Release-B'
 $sameArguments = Join-SafeWindowsArguments -Arguments @(
     '-NoProfile', '-File', $currentWrapperPath, '-Action', 'Run'
 )
@@ -331,8 +333,14 @@ $unknown = [pscustomobject]@{
         Arguments = '-File "C:\Other\maintenance.ps1" -Action Run'
     })
 }
+$direct = [pscustomobject]@{
+    Actions = @([pscustomobject]@{
+        Arguments = '"-3" "C:\Release-B\Tarkov-CIS-Python.py" "run" "--config" "C:\Release-B\config.json"'
+    })
+}
 [pscustomobject]@{
     SameIsCurrent = Test-TaskUsesThisWrapper -Task $same
+    DirectIsCurrent = Test-TaskUsesThisWrapper -Task $direct
     MovedPath = Get-PythonWrapperPath -Task $moved
     MovedIsCurrent = Test-TaskUsesThisWrapper -Task $moved
     UnknownPath = Get-PythonWrapperPath -Task $unknown
@@ -351,6 +359,7 @@ $unknown = [pscustomobject]@{
         self.assertEqual(0, result.returncode, result.stderr or result.stdout)
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertTrue(payload["SameIsCurrent"])
+        self.assertTrue(payload["DirectIsCurrent"])
         self.assertEqual(
             r"C:\Release-A\scripts\python-task.ps1", payload["MovedPath"]
         )

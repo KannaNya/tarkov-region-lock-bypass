@@ -21,7 +21,8 @@
     [int]$NativeCatalogMaxAgeHours = 24,
     [string]$RelayCountry,
     [string]$StatePath,
-    [switch]$TestMode
+    [switch]$TestMode,
+    [switch]$DeferRouteProtection
 )
 
 $ErrorActionPreference = 'Stop'
@@ -745,6 +746,11 @@ function Ensure-VpnAccount {
 
 function Protect-PhysicalDefaultRoute {
     param($Vpn)
+    if ($DeferRouteProtection) {
+        # Keeper captures/persists the untouched metric before its own change.
+        return Get-NetRoute -PolicyStore ActiveStore -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+            Where-Object InterfaceIndex -ne $Vpn.InterfaceIndex | Select-Object -First 1
+    }
     Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $Vpn.InterfaceIndex -ErrorAction SilentlyContinue |
         Set-NetRoute -RouteMetric 9000 -PolicyStore ActiveStore -ErrorAction SilentlyContinue
 

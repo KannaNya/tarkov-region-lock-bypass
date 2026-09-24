@@ -15,6 +15,13 @@ _FIELD_ALIASES = {
     "refresh_seconds": "RefreshSeconds",
     "failed_cycle_retry_seconds": "FailedCycleRetrySeconds",
     "disconnected_poll_seconds": "DisconnectedPollSeconds",
+    "health_failure_threshold": "HealthFailureThreshold",
+    "session_failure_threshold": "SessionFailureThreshold",
+    "failed_cycle_backoff_max_seconds": "FailedCycleBackoffMaxSeconds",
+    "pause_during_raid": "PauseDuringRaid",
+    "game_phase_max_age_days": "GamePhaseMaxAgeDays",
+    "game_phase_max_files": "GamePhaseMaxFiles",
+    "game_phase_max_bytes_per_file": "GamePhaseMaxBytesPerFile",
     "game_log_roots": "GameLogRoots",
     "target_hosts": "TargetHosts",
     "raid_targets": "RaidTargets",
@@ -42,7 +49,9 @@ DEFAULT_TARGET_HOSTS = (
     "gw-pvp.escapefromtarkov.ru",
     "gw-pvp.escapefromtarkov.com",
     "gw-pvp-season.escapefromtarkov.ru",
+    "gw-pvp-season.escapefromtarkov.com",
     "lobby.escapefromtarkov.ru",
+    "lobby.escapefromtarkov.com",
 )
 
 
@@ -68,6 +77,18 @@ def _positive_int(value: Any, name: str, *, allow_zero: bool = False) -> int:
     return result
 
 
+def _bool(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    raise ValueError(f"{name} must be a boolean")
+
+
 def _string_tuple(value: Any, name: str) -> tuple[str, ...]:
     if value is None:
         return ()
@@ -88,6 +109,17 @@ class AppConfig:
     refresh_seconds: int = 30
     failed_cycle_retry_seconds: int = 10
     disconnected_poll_seconds: int = 5
+    # Do not rotate a relay because one authorization hostname missed one
+    # probe.  These counters are intentionally consecutive-cycle thresholds.
+    health_failure_threshold: int = 3
+    session_failure_threshold: int = 3
+    failed_cycle_backoff_max_seconds: int = 120
+    # Login/character selection keep normal health checks. Matching and Raid
+    # freeze maintenance until a later menu/PostRaid marker or game exit.
+    pause_during_raid: bool = True
+    game_phase_max_age_days: int = 2
+    game_phase_max_files: int = 24
+    game_phase_max_bytes_per_file: int = 256 * 1024
     game_log_roots: tuple[str, ...] = ()
     target_hosts: tuple[str, ...] = DEFAULT_TARGET_HOSTS
     raid_targets: tuple[str, ...] = ()
@@ -146,6 +178,12 @@ class AppConfig:
             "refresh_seconds",
             "failed_cycle_retry_seconds",
             "disconnected_poll_seconds",
+            "health_failure_threshold",
+            "session_failure_threshold",
+            "failed_cycle_backoff_max_seconds",
+            "game_phase_max_age_days",
+            "game_phase_max_files",
+            "game_phase_max_bytes_per_file",
             "connect_timeout_seconds",
             "disconnect_wait_seconds",
             "resource_busy_retry_count",
@@ -171,6 +209,10 @@ class AppConfig:
                 name,
                 allow_zero=name in {"cooling_fallback_minutes", "resource_busy_retry_count"},
             )
+        values["pause_during_raid"] = _bool(
+            _read_value(data, "pause_during_raid", getattr(defaults, "pause_during_raid")),
+            "pause_during_raid",
+        )
         values["failed_cycle_retry_seconds"] = max(5, values["failed_cycle_retry_seconds"])
         values["disconnected_poll_seconds"] = max(1, values["disconnected_poll_seconds"])
         values["extras"] = extras

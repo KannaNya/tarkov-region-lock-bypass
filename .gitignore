@@ -2,6 +2,7 @@
 outputs/
 work/
 *.log
+*.log.*
 *.pid
 *.state.json
 

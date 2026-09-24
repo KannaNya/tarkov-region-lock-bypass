@@ -63,6 +63,7 @@ class SoftEtherClient:
         powershell: str = "powershell.exe",
         runner: Runner = run_command,
         command_timeout: float = 15.0,
+        operation_guard: Callable[[], None] | None = None,
     ) -> None:
         self.vpncmd_path = Path(vpncmd_path)
         self.account_name = account_name
@@ -71,8 +72,14 @@ class SoftEtherClient:
         self.powershell = powershell
         self._run = runner
         self.command_timeout = command_timeout
+        self.operation_guard = operation_guard
+
+    def _check_operation(self) -> None:
+        if self.operation_guard is not None:
+            self.operation_guard()
 
     def _vpncmd(self, *arguments: str, timeout: float | None = None) -> CommandResult:
+        self._check_operation()
         result = self._run(
             [
                 str(self.vpncmd_path),
@@ -95,6 +102,7 @@ class SoftEtherClient:
     def account_status(self, *, timeout: float | None = None) -> CommandResult:
         # /CSV improves stability of the machine-readable fields, while the
         # SID check remains independent of the installed UI language.
+        self._check_operation()
         return self._run(
             [
                 str(self.vpncmd_path),
@@ -116,6 +124,7 @@ class SoftEtherClient:
         return SESSION_ID_RE.search(result.stdout + "\n" + result.stderr) is not None
 
     def get_lease(self, *, timeout: float | None = None) -> VpnLease | None:
+        self._check_operation()
         alias = _powershell_quote(self.interface_alias)
         script = (
             "$ErrorActionPreference='Stop';"
@@ -162,6 +171,7 @@ class SoftEtherClient:
         return self.get_lease(timeout=timeout)
 
     def probe_tcp(self, relay: Any, *, timeout: float = 1.5) -> bool:
+        self._check_operation()
         host = str(getattr(relay, "ip", "") or getattr(relay, "host_name", ""))
         port = int(getattr(relay, "port", 0))
         if not host or not 1 <= port <= 65535:
@@ -226,6 +236,7 @@ class SoftEtherClient:
         self._vpncmd("AccountStatusHide", self.account_name, timeout=remaining())
 
     def disconnect(self, *, timeout: float = 15.0, poll_interval: float = 0.25) -> bool:
+        self._check_operation()
         deadline = time.monotonic() + max(timeout, 0.1)
         result = self._run(
             [

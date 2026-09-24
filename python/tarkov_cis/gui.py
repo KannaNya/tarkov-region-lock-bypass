@@ -151,7 +151,12 @@ def _format_status(value: Any) -> str:
             parts.append("旧状态已忽略")
         if value.get("connection_phase"):
             parts.append(str(value["connection_phase"]))
-        if "vpn_verified" in value:
+        if value.get("game_phase"):
+            phase = str(value["game_phase"])
+            parts.append("Raid 保护中" if value.get("play_protected") else f"游戏阶段 {phase}")
+        if value.get("vpn_probe_paused"):
+            parts.append("VPN 探测已暂停（保留现有会话）")
+        elif "vpn_verified" in value:
             parts.append("VPN 已验证" if value["vpn_verified"] else "VPN 未连接")
         if value.get("vpn_ipv4"):
             parts.append(f"VPN {value['vpn_ipv4']}")

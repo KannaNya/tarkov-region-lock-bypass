@@ -68,6 +68,8 @@ function Get-PythonRuntime {
         (Join-Path $projectRoot 'TarkovCIS.exe'),
         (Join-Path $projectRoot 'dist\TarkovCIS\TarkovCIS.exe')
     )
+    # Source worktrees must not silently run an older frozen build.
+    if (-not (Test-Path -LiteralPath (Join-Path $projectRoot 'Tarkov-CIS-Python.py'))) {
     foreach ($candidate in $executableCandidates) {
         if (Test-Path -LiteralPath $candidate -PathType Leaf) {
             return [pscustomobject]@{
@@ -76,6 +78,7 @@ function Get-PythonRuntime {
                 PrefixArguments = [string[]]@()
             }
         }
+    }
     }
 
     $sourceEntry = Join-Path $projectRoot 'Tarkov-CIS-Python.py'
@@ -167,12 +170,38 @@ function Test-TaskUsesThisWrapper {
     param([Parameter(Mandatory = $true)]$Task)
 
     $candidate = Get-PythonWrapperPath -Task $Task
-    if (-not $candidate) { return $false }
-    try {
-        return [IO.Path]::GetFullPath($candidate) -ieq $currentWrapperPath
-    } catch {
-        return $false
+    if ($candidate) {
+        try {
+            if ([IO.Path]::GetFullPath($candidate) -ieq $currentWrapperPath) {
+                return $true
+            }
+        } catch {
+            return $false
+        }
     }
+    # New installations run the Python entry point directly from Task
+    # Scheduler.  The PowerShell file remains only the control/migration
+    # surface, so do not classify a direct Python action as legacy.
+    Test-TaskUsesDirectPythonRuntime -Task $Task
+}
+
+function Test-TaskUsesDirectPythonRuntime {
+    param([Parameter(Mandatory = $true)]$Task)
+
+    $sourceEntry = [regex]::Escape((Join-Path $projectRoot 'Tarkov-CIS-Python.py'))
+    $sourceExe = [regex]::Escape((Join-Path $projectRoot 'TarkovCIS.exe'))
+    $bundleExe = [regex]::Escape((Join-Path $projectRoot 'dist\TarkovCIS\TarkovCIS.exe'))
+    foreach ($action in @($Task.Actions)) {
+        $arguments = [string]$action.Arguments
+        $isRun = $arguments -match '(?i)(?:^|\s)"?run"?(?:\s|$)'
+        if (-not $isRun) { continue }
+        if ($arguments -match $sourceEntry -or
+            $arguments -match $sourceExe -or
+            $arguments -match $bundleExe) {
+            return $true
+        }
+    }
+    $false
 }
 
 function Get-LegacyKeeperPath {
@@ -197,13 +226,20 @@ function Stop-LegacyKeeperSafely {
         [Parameter(Mandatory = $true)][string]$ResolvedConfigPath
     )
 
+    # The compatibility filename may now host Python. Request its token-bound
+    # cleanup before the legacy path is permitted to stop the scheduler task.
+    $pythonPidPath = Join-Path $env:LOCALAPPDATA 'TarkovCIS\keeper.pid.json'
+    if (Test-Path -LiteralPath $pythonPidPath) {
+        $cleanupRuntime = Get-PythonRuntime
+        Invoke-PythonCommand -Runtime $cleanupRuntime -Command cleanup -ResolvedConfigPath $ResolvedConfigPath
+    }
     $shell = Get-TaskPowerShell
     [string[]]$arguments = @(
         '-NoProfile',
         '-NonInteractive',
         '-ExecutionPolicy', 'Bypass',
         '-File', $LegacyKeeperPath,
-        '-Action', 'Stop',
+        '-Action', 'Stop', '-Legacy',
         '-ConfigPath', $ResolvedConfigPath
     )
     & $shell @arguments
@@ -221,6 +257,14 @@ function Stop-PythonTaskSafely {
 
     Invoke-PythonCommand -Runtime $Runtime -Command cleanup -ResolvedConfigPath $ResolvedConfigPath -AllowFailure
     $stopExitCode = $script:LastPythonExitCode
+    if ($stopExitCode -ne 0) {
+        # A SoftEther disconnect can remove an owned route between the first
+        # read and the delete.  Cleanup is idempotent, so retry once after the
+        # adapter state has settled; never turn this into an infinite loop.
+        Start-Sleep -Milliseconds 500
+        Invoke-PythonCommand -Runtime $Runtime -Command cleanup -ResolvedConfigPath $ResolvedConfigPath -AllowFailure
+        $stopExitCode = $script:LastPythonExitCode
+    }
     if ($stopExitCode -ne 0) {
         throw 'The Python keeper did not finish its bounded cleanup; the scheduled task was not force-stopped.'
     }
@@ -279,16 +323,22 @@ try {
 
     if ($Action -eq 'Install') {
         $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-        if ($existing -and [string]$existing.State -eq 'Running' -and (Test-TaskUsesThisWrapper -Task $existing)) {
+        if ($existing -and [string]$existing.State -eq 'Running' -and
+            (Test-TaskUsesDirectPythonRuntime -Task $existing)) {
             Write-Host "$taskName is already running; the duplicate Install request was ignored."
             exit 0
         }
 
-        if ($existing -and -not (Test-TaskUsesThisWrapper -Task $existing)) {
+        $existingIsDirectPython = if ($existing) {
+            Test-TaskUsesDirectPythonRuntime -Task $existing
+        } else {
+            $false
+        }
+        if ($existing -and -not $existingIsDirectPython) {
             $pythonWrapper = Get-PythonWrapperPath -Task $existing
             $legacyKeeper = Get-LegacyKeeperPath -Task $existing
             if ($pythonWrapper) {
-                Write-Host "Migrating the Python keeper from $pythonWrapper after shared PID/token cleanup."
+                Write-Host "Migrating the Python keeper after shared PID/token cleanup."
                 $migrationRuntime = Get-PythonRuntime
                 Stop-PythonTaskSafely -TaskName $taskName -Runtime $migrationRuntime -ResolvedConfigPath $resolvedConfigPath
             } elseif ($legacyKeeper) {
@@ -300,21 +350,24 @@ try {
             } else {
                 throw "A different scheduled task already uses the name $taskName; refusing to overwrite it."
             }
+        } elseif ($existing -and [string]$existing.State -ne 'Running') {
+            # A stopped direct-Python task can still own persisted /32 routes.
+            # Reuse the same token-bound cleanup before replacing it.
+            Write-Host "Cleaning the stopped Python keeper before reinstalling it."
+            $migrationRuntime = Get-PythonRuntime
+            Stop-PythonTaskSafely -TaskName $taskName -Runtime $migrationRuntime -ResolvedConfigPath $resolvedConfigPath
         }
 
         $runtime = Get-PythonRuntime
-        $taskShell = Get-TaskPowerShell
-        [string[]]$taskArgumentArray = @(
-            '-NoProfile',
-            '-NonInteractive',
-            '-WindowStyle', 'Hidden',
-            '-ExecutionPolicy', 'Bypass',
-            '-File', $PSCommandPath,
-            '-Action', 'Run',
-            '-ConfigPath', $resolvedConfigPath
+        # The scheduled task must execute Python directly.  This keeps the
+        # long-running Keeper independent from PowerShell; this script is only
+        # used for install/migration/control and legacy cleanup.
+        [string[]]$taskArgumentArray = @($runtime.PrefixArguments) + @(
+            'run',
+            '--config', $resolvedConfigPath
         )
         $taskAction = New-ScheduledTaskAction `
-            -Execute $taskShell `
+            -Execute $runtime.FilePath `
             -Argument (Join-SafeWindowsArguments -Arguments $taskArgumentArray) `
             -WorkingDirectory $projectRoot
         $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -346,9 +399,10 @@ try {
         $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         if ($existing -and -not (Test-TaskUsesThisWrapper -Task $existing)) {
             $pythonWrapper = Get-PythonWrapperPath -Task $existing
+            $directPython = Test-TaskUsesDirectPythonRuntime -Task $existing
             $legacyKeeper = Get-LegacyKeeperPath -Task $existing
-            if ($pythonWrapper) {
-                Write-Host "Stopping the Python keeper installed from $pythonWrapper through shared PID/token cleanup."
+            if ($pythonWrapper -or $directPython) {
+                Write-Host "Stopping the Python keeper through shared PID/token cleanup."
             } elseif ($legacyKeeper) {
                 Write-Host "Stopping the legacy PowerShell keeper through its own cleanup path."
                 Stop-LegacyKeeperSafely -LegacyKeeperPath $legacyKeeper -ResolvedConfigPath $resolvedConfigPath

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import ipaddress
+import os
 from pathlib import Path
 import queue
 import re
@@ -18,7 +19,9 @@ DEFAULT_AUTHORIZATION_HOSTS = (
     "gw-pvp.escapefromtarkov.ru",
     "gw-pvp.escapefromtarkov.com",
     "gw-pvp-season.escapefromtarkov.ru",
+    "gw-pvp-season.escapefromtarkov.com",
     "lobby.escapefromtarkov.ru",
+    "lobby.escapefromtarkov.com",
 )
 
 # Do not broaden this to a generic escapefromtarkov.com matcher.  CDN,
@@ -39,6 +42,32 @@ class AuthorizationTarget:
 
 
 Resolver = Callable[..., list[tuple]]
+
+
+def discover_log_roots(configured=(), *, drive_roots=None) -> tuple[Path, ...]:
+    """Augment config from bounded conventional paths on fixed local drives.
+
+    Configured paths seed equivalent paths on other drives after a game move.
+    No registry changes, whole-disk traversal, or persisted private paths.
+    """
+    roots = {Path(value) for value in configured}
+    if drive_roots is None:
+        if os.name != 'nt':
+            return tuple(sorted(roots, key=str))
+        import ctypes
+        drive_roots = [Path(f'{letter}:/') for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+                       if ctypes.windll.kernel32.GetDriveTypeW(f'{letter}:\\') == 3]
+    suffixes = {Path('GAME/Tarkov/Logs'), Path('Battlestate Games/EFT/Logs'),
+                Path('Games/EFT/Logs'), Path('Program Files (x86)/Escape from Tarkov/Logs')}
+    for root in tuple(roots):
+        if root.anchor:
+            suffixes.add(Path(*root.parts[1:]))
+    for drive in drive_roots:
+        for suffix in suffixes:
+            candidate = Path(drive) / suffix
+            if candidate.is_dir():
+                roots.add(candidate)
+    return tuple(sorted(roots, key=str))
 
 
 def is_authorization_host(value: str) -> bool:

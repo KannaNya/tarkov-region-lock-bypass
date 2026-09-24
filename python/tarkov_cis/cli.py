@@ -20,6 +20,8 @@ from urllib.request import Request, urlopen
 from .catalog import NativeCatalogReader, parse_vpngate_csv
 from .config import AppConfig
 from .keeper import KeeperService
+from .health import probe_authorization
+from .game_phase import PlayProtectionActivated, configured_game_phase_probe
 from .log_sink import RotatingLogSink, tail_log
 from .models import FailureRecord, Relay
 from .process_runner import run_command
@@ -358,6 +360,9 @@ def _write_keeper_status(
         "vpn_ipv4": status.vpn_ipv4,
         "target_count": status.target_count,
         "failed_candidates": status.failed_candidates,
+        "game_phase": status.game_phase,
+        "game_evidence": status.game_evidence,
+        "play_protected": status.play_protected,
         "updated_at": status.updated_at.isoformat(),
     }
     temporary = path.with_suffix(".tmp")
@@ -383,6 +388,8 @@ def build_runtime(config: AppConfig, logger=print, status_sink=None) -> KeeperSe
         routes=routes,
         logger=logger,
         status_sink=status_sink,
+        health_probe=probe_authorization,
+        game_phase_probe=configured_game_phase_probe(config),
     )
 
 
@@ -450,7 +457,11 @@ def _scheduled_task_info(task_name: str) -> dict[str, str]:
             raise RuntimeError("scheduled task query returned no data")
         payload = json.loads(result.stdout)
         arguments = str(payload.get("Arguments", "")).lower()
-        if "python-task.ps1" in arguments:
+        if (
+            "python-task.ps1" in arguments
+            or "tarkov-cis-python.py" in arguments
+            or "tarkovcis.exe" in arguments
+        ):
             implementation = "python"
         elif "tarkov-cisroutekeeper.ps1" in arguments:
             implementation = "legacy-powershell"
@@ -840,15 +851,21 @@ def status_snapshot(config_path: Path) -> dict[str, Any]:
     pid_state = _read_json(pid_path)
     process_running = _pid_state_matches_live_process(pid_state)
     runtime = build_runtime(config, logger=lambda _message: None)
-    try:
-        lease = runtime.softether.verified_connection()
-    except Exception:
-        lease = None
     persisted_raw = _read_json(_local_state_directory() / "keeper-status.json") or {}
     persisted_matches = bool(
         process_running and _status_matches_pid_state(persisted_raw, pid_state)
     )
     persisted = persisted_raw if persisted_matches else {}
+    probe_paused = bool(persisted.get("play_protected", False))
+    lease = None
+    if not probe_paused:
+        try:
+            lease = runtime.softether.verified_connection()
+        except PlayProtectionActivated:
+            # Status/UI refreshes must not bypass the keeper's play guard.
+            probe_paused = True
+        except Exception:
+            pass
     output: dict[str, Any] = {
         "task_name": config.task_name,
         "task_state": task_info["state"],
@@ -862,10 +879,14 @@ def status_snapshot(config_path: Path) -> dict[str, Any]:
         "detail": persisted.get("detail"),
         "relay": persisted.get("relay"),
         "country": persisted.get("country"),
-        "vpn_verified": lease is not None,
+        "vpn_verified": None if probe_paused else lease is not None,
+        "vpn_probe_paused": probe_paused,
         "vpn_interface": lease.interface_alias if lease else config.vpn_interface_alias,
-        "vpn_ipv4": lease.ipv4 if lease else None,
+        "vpn_ipv4": lease.ipv4 if lease else persisted.get("vpn_ipv4") if probe_paused else None,
         "managed_authorization_routes": len(runtime.routes.managed),
+        "game_phase": persisted.get("game_phase"),
+        "game_evidence": persisted.get("game_evidence"),
+        "play_protected": bool(persisted.get("play_protected", False)),
     }
     return output
 

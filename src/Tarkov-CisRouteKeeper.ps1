@@ -2,10 +2,22 @@ param(
     [ValidateSet('Install', 'Run', 'Status', 'Stop', 'Uninstall')]
     [string]$Action = 'Status',
     [string]$ConfigPath = (Join-Path $PSScriptRoot '..\config.json'),
-    [int]$RefreshSeconds = 30
+    [int]$RefreshSeconds = 30,
+    [switch]$Legacy
 )
 
 $ErrorActionPreference = 'Stop'
+# Existing scheduled-task filename now delegates future starts to Python.
+# The already-running legacy process is not stopped by a source-only change.
+$pythonPidPath = Join-Path $env:LOCALAPPDATA 'TarkovCIS\keeper.pid.json'
+if (-not $Legacy -and ($Action -in @('Run', 'Install') -or
+    (Test-Path -LiteralPath $pythonPidPath))) {
+    if ($Action -eq 'Run' -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'Tarkov-CisRouteKeeper.state.json'))) {
+        throw 'Legacy route ownership remains. Use python-task.ps1 -Action Install for controlled cleanup/migration before starting Python.'
+    }
+    & (Join-Path $PSScriptRoot '..\scripts\python-task.ps1') -Action $Action -ConfigPath $ConfigPath
+    exit $LASTEXITCODE
+}
 $scriptRoot = (Resolve-Path $PSScriptRoot).Path
 $statePath = Join-Path $scriptRoot 'Tarkov-CisRouteKeeper.state.json'
 $pidPath = Join-Path $scriptRoot 'Tarkov-CisRouteKeeper.pid'
@@ -244,6 +256,7 @@ function Remove-StateRoutes {
 function Sync-Routes {
     param($Vpn, $Targets)
     $desired = @($Targets.IPAddress | Sort-Object -Unique)
+    if (-not $desired) { throw 'No DNS targets resolved; previous owned routes retained.' }
     $saved = Read-State
     $oldIPs = if ($saved) { @($saved.ManagedIPs) } else { @() }
     $originalDefaults = if ($saved -and $saved.OriginalDefaults) {
@@ -277,7 +290,8 @@ function Sync-Routes {
         }
     }
 
-    Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $Vpn.InterfaceIndex -ErrorAction SilentlyContinue |
+    Write-State -Vpn $Vpn -IPs $desired -Hosts (Get-ObservedHosts) -OriginalDefaults $originalDefaults
+    Get-NetRoute -PolicyStore ActiveStore -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $Vpn.InterfaceIndex -ErrorAction SilentlyContinue |
         Set-NetRoute -RouteMetric 9000 -PolicyStore ActiveStore
     Write-State -Vpn $Vpn -IPs $desired -Hosts (Get-ObservedHosts) -OriginalDefaults $originalDefaults
 }
@@ -389,7 +403,7 @@ try {
                     # warnings, verbose diagnostics and connector errors visible
                     # in the long-running task log.
                     try {
-                        & $connectorPath -Action Connect -InterfaceAlias $vpnAlias *>&1 |
+                        & $connectorPath -Action Connect -InterfaceAlias $vpnAlias -DeferRouteProtection *>&1 |
                             ForEach-Object { Write-ConnectorStream -Record $_ }
                     } catch {
                         Write-Log "Connector cycle failed: $($_.Exception.Message)"

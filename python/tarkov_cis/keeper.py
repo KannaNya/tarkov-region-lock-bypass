@@ -10,7 +10,9 @@ import time
 from typing import Any, Callable, Iterable
 
 from .eft_logs import discover_authorization_hosts, resolve_authorization_targets
+from .game_phase import GamePhase, GamePhaseSnapshot, PlayProtectionActivated
 from .models import ConnectionPhase
+from .process_runner import CommandError
 from .routing import RouteManager
 from .softether import LocalResourceBusyError, SoftEtherClient, SoftEtherError, VpnLease
 from .state_machine import ConnectionEvent, ConnectionStateMachine, InvalidTransition
@@ -23,6 +25,7 @@ class KeeperPhase(str, Enum):
     CONNECTING = "connecting"
     APPLYING_ROUTES = "applying_routes"
     READY = "ready"
+    PLAY_PROTECTED = "play_protected"
     SWITCHING = "switching"
     RETRY_WAIT = "retry_wait"
     FAILED = "failed"
@@ -39,6 +42,9 @@ class KeeperStatus:
     vpn_ipv4: str = ""
     target_count: int = 0
     failed_candidates: int = 0
+    game_phase: str = GamePhaseSnapshot().phase.value
+    game_evidence: str = ""
+    play_protected: bool = False
     updated_at: datetime = datetime.min.replace(tzinfo=timezone.utc)
 
 
@@ -70,6 +76,8 @@ class KeeperService:
         routes: RouteManager,
         logger: LogSink | None = None,
         status_sink: StatusSink | None = None,
+        health_probe: Callable | None = None,
+        game_phase_probe: Callable[[], GamePhaseSnapshot] | None = None,
     ) -> None:
         self.config = config
         self.candidate_provider = candidate_provider
@@ -82,6 +90,22 @@ class KeeperService:
         self._lock = threading.Lock()
         self._status = KeeperStatus()
         self.machine = ConnectionStateMachine.initial()
+        self.health_probe = health_probe
+        self.game_phase_probe = game_phase_probe
+        self._health_failures = 0
+        self._session_failures = 0
+        self._last_verified_lease: VpnLease | None = None
+        self._last_targets: tuple[Any, ...] = ()
+        self._last_identity = None
+        self._health_switch = False
+        self._active_relay = None
+        self._last_game_phase = GamePhaseSnapshot()
+        self._explicit_cleanup = False
+        # Guard individual adapter commands too: connect()/sync() may perform
+        # several destructive operations after a slow preceding command.
+        for adapter in (self.softether, self.routes):
+            if isinstance(adapter, (SoftEtherClient, RouteManager)):
+                adapter.operation_guard = self._check_play_protection
 
     @property
     def status(self) -> KeeperStatus:
@@ -145,6 +169,13 @@ class KeeperService:
     def _restore_session_phase(self) -> None:
         if self.machine.phase in {ConnectionPhase.READY, ConnectionPhase.APPLYING_ROUTES}:
             return
+        # A play guard may suspend an in-flight connection before its state
+        # transitions finish.  A fresh verified lease can resume those states.
+        if self.machine.phase is ConnectionPhase.CONNECTING:
+            self.machine.tcp_connected()
+        if self.machine.phase is ConnectionPhase.VERIFYING_SESSION:
+            self.machine.session_established()
+            return
         if self.machine.phase in {
             ConnectionPhase.DISCONNECTED,
             ConnectionPhase.DISCOVERING,
@@ -192,19 +223,111 @@ class KeeperService:
     def _disconnect_timeout(self) -> float:
         return max(1.0, float(getattr(self.config, "disconnect_wait_seconds", 15)))
 
+    def _health_failure_limit(self) -> int:
+        return max(1, int(getattr(self.config, "health_failure_threshold", 3)))
+
+    def _session_failure_limit(self) -> int:
+        return max(1, int(getattr(self.config, "session_failure_threshold", 3)))
+
+    def _failed_cycle_backoff_max(self) -> int:
+        base = max(1, int(getattr(self.config, "failed_cycle_retry_seconds", 10)))
+        return max(base, int(getattr(self.config, "failed_cycle_backoff_max_seconds", 120)))
+
+    def _game_phase(self) -> GamePhaseSnapshot:
+        probe = self.game_phase_probe
+        if probe is None:
+            return GamePhaseSnapshot()
+        try:
+            snapshot = probe()
+        except Exception as exc:
+            self._logger(f"[warning] 游戏阶段读取失败：{exc}")
+            snapshot = GamePhaseSnapshot(detail=f"阶段读取失败：{exc}", process_running=None)
+        if not isinstance(snapshot, GamePhaseSnapshot):
+            self._logger("[warning] 游戏阶段探测器返回了无效结果，按未知阶段处理")
+            snapshot = GamePhaseSnapshot(detail="阶段探测器返回无效结果", process_running=None)
+        previous = self._last_game_phase
+        same_session = not (
+            previous.session_id and snapshot.session_id
+            and previous.session_id != snapshot.session_id
+        )
+        if (
+            same_session
+            and previous.phase in {GamePhase.MATCHMAKING, GamePhase.RAID}
+            and previous.process_running is not False
+            and snapshot.process_running is not False
+            and (
+                snapshot.phase is GamePhase.UNKNOWN
+                or (
+                    previous.observed_at is not None
+                    and snapshot.observed_at is not None
+                    and snapshot.observed_at < previous.observed_at
+                )
+            )
+        ):
+            # Bounded tails can lose the start marker; an unreadable log or
+            # process query must not silently unlock a known active Raid.
+            snapshot = replace(previous, process_running=snapshot.process_running)
+        self._last_game_phase = snapshot
+        return snapshot
+
+    def _check_play_protection(self) -> None:
+        if self._explicit_cleanup or not self._raid_protection_enabled():
+            return
+        if self._protect_active_raid(self._game_phase()):
+            raise PlayProtectionActivated()
+
+    def _raid_protection_enabled(self) -> bool:
+        return bool(getattr(self.config, "pause_during_raid", True))
+
+    def _protect_active_raid(self, snapshot: GamePhaseSnapshot) -> bool:
+        """Freeze reconciliation once matching has begun and during a Raid."""
+
+        protected_phases = {GamePhase.MATCHMAKING, GamePhase.RAID}
+        if not self._raid_protection_enabled() or snapshot.phase not in protected_phases:
+            return False
+        # A stale marker from an old log must not freeze a fresh login.  The
+        # parser only marks protection active while the game process exists.
+        if snapshot.process_running is False:
+            return False
+        # Pre-Raid misses do not count as consecutive failures after a match.
+        self._health_failures = 0
+        self._session_failures = 0
+        self._health_switch = False
+        current = self.status
+        label = "Raid" if snapshot.phase is GamePhase.RAID else "匹配"
+        self._set_status(
+            KeeperPhase.PLAY_PROTECTED,
+            f"{label}保护中：暂停节点切换（{snapshot.detail}）",
+            game_phase=snapshot.phase.value,
+            game_evidence=snapshot.detail,
+            play_protected=True,
+            relay=current.relay,
+            country=current.country,
+            vpn_ipv4=current.vpn_ipv4,
+        )
+        return True
+
     def _best_effort_reset(self) -> None:
+        self._check_play_protection()
         try:
             self.routes.cleanup()
+        except PlayProtectionActivated:
+            raise
         except Exception as exc:
             self._logger(f"[warning] 临时路由清理失败: {exc}")
+        self._check_play_protection()
         try:
             self.softether.disconnect(timeout=self._disconnect_timeout())
+        except PlayProtectionActivated:
+            raise
         except Exception as exc:
             self._logger(f"[warning] SoftEther 会话清理失败: {exc}")
 
     def _authorization_targets(self) -> tuple[Any, ...]:
-        roots = tuple(getattr(self.config, "game_log_roots", ()) or ())
-        static_hosts = tuple(getattr(self.config, "target_hosts", ()) or ())
+        from .eft_logs import discover_log_roots
+        roots = discover_log_roots(getattr(self.config, "game_log_roots", ()) or ())
+        from .eft_logs import DEFAULT_AUTHORIZATION_HOSTS
+        static_hosts = tuple(getattr(self.config, "target_hosts", ()) or ()) + DEFAULT_AUTHORIZATION_HOSTS
         hosts = discover_authorization_hosts(roots, static_hosts=static_hosts)
         return resolve_authorization_targets(hosts)
 
@@ -215,25 +338,29 @@ class KeeperService:
         *,
         deadline: float | None = None,
     ) -> bool:
+        self._check_play_protection()
         self._restore_session_phase()
         try:
             targets = self._authorization_targets()
         except Exception as exc:
-            self.machine.transition(ConnectionEvent.ROUTES_FAILED, reason=str(exc))
-            try:
-                self.routes.cleanup()
-            except Exception as cleanup_exc:
-                raise RuntimeError(
-                    f"authorization target resolution failed and stale routes could not be cleaned: {cleanup_exc}"
-                ) from exc
-            raise
+            self._logger(f"[warning] DNS resolution failed: {exc}")
+            targets = ()
+        self._check_play_protection()
+        identity = (lease.interface_index, lease.gateway)
         if not targets:
+            # Never interpret transient DNS failure as an instruction to delete
+            # healthy /32 routes. Do not carry a lease's routes onto another NIC.
+            if self._last_targets and identity == self._last_identity:
+                self._set_status(KeeperPhase.RETRY_WAIT, "DNS 暂无结果；保留上一组鉴权 /32，稍后重试")
+                return False
             self.machine.transition(
                 ConnectionEvent.ROUTES_FAILED,
                 reason="no authorization targets resolved",
             )
             try:
                 self.routes.cleanup()
+            except PlayProtectionActivated:
+                raise
             except Exception as exc:
                 self._set_status(
                     KeeperPhase.FAILED,
@@ -252,12 +379,29 @@ class KeeperService:
                 lease,
                 deadline=deadline,
             )
+        except PlayProtectionActivated:
+            raise
         except Exception as exc:
+            self._check_play_protection()
             if self.machine.phase in {ConnectionPhase.APPLYING_ROUTES, ConnectionPhase.READY}:
                 self.machine.transition(ConnectionEvent.ROUTES_FAILED, reason=str(exc))
             raise
         if self.machine.phase is ConnectionPhase.APPLYING_ROUTES:
             self.machine.routes_applied()
+        self._last_targets, self._last_identity = targets, identity
+        if self.health_probe is not None:
+            self._check_play_protection()
+            health = self.health_probe(targets, deadline=deadline)
+            self._check_play_protection()
+            if not health.ok:
+                self._health_failures += 1
+                limit = self._health_failure_limit()
+                self._health_switch = self._health_failures >= limit
+                self._set_status(KeeperPhase.RETRY_WAIT,
+                                 f"HTTPS 响应探测失败 {self._health_failures}/{limit}: {health.detail}；保留当前会话")
+                return False
+            self._health_failures = 0
+            self._health_switch = False
         if relay is not None:
             self._record_success(relay)
         self._set_status(
@@ -273,33 +417,106 @@ class KeeperService:
     def run_cycle(self) -> bool:
         """Run one health/reconciliation cycle; switch after relay failures."""
 
+        try:
+            return self._run_cycle()
+        except PlayProtectionActivated:
+            # This is a successful pause, not a relay failure.  In particular,
+            # do not route it through reset()/disconnect() exception handlers.
+            return True
+
+    def _run_cycle(self) -> bool:
+
+        snapshot = self._game_phase()
+        self._last_game_phase = snapshot
+        if self._protect_active_raid(snapshot):
+            # Do not call verified_connection(), DNS, HTTPS health probes,
+            # route cleanup, disconnect(), or candidate discovery here.  The
+            # current /32 routes and SoftEther session stay untouched from
+            # matching through Raid until UserMatchOver / PostRaid brings the
+            # next cycle safely back to the menu.
+            return True
+
+        skip_endpoint = ""
         failover_deadline = time.monotonic() + max(
             1, int(getattr(self.config, "failover_timeout_seconds", 180))
         )
-        self._set_status(KeeperPhase.CHECKING, "正在检查 SoftEther 会话和 VPN 网卡")
+        self._set_status(
+            KeeperPhase.CHECKING,
+            "正在检查 SoftEther 会话和 VPN 网卡",
+            game_phase=snapshot.phase.value,
+            game_evidence=snapshot.detail,
+            play_protected=False,
+        )
         try:
             lease = self.softether.verified_connection()
+        except PlayProtectionActivated:
+            raise
         except Exception as exc:
             self._logger(f"[warning] 会话检查失败: {exc}")
             lease = None
+        self._check_play_protection()
+        if lease is None:
+            if self._last_verified_lease is not None:
+                self._session_failures += 1
+                limit = self._session_failure_limit()
+                if self._session_failures < limit:
+                    self._set_status(
+                        KeeperPhase.RETRY_WAIT,
+                        f"SoftEther 会话/租约暂时不可读 {self._session_failures}/{limit}；不重置虚拟网卡",
+                        vpn_ipv4=self._last_verified_lease.ipv4,
+                    )
+                    return False
+                self._logger(
+                    f"[switching] SoftEther 会话/租约连续 {self._session_failures} 次不可读，开始有界节点切换"
+                )
+                self._last_verified_lease = None
+                self._session_failures = 0
+            # No previously verified session exists; initial discovery is safe.
+        else:
+            # A single successful verification clears only the session-loss
+            # counter.  Health failures are tracked independently below.
+            self._session_failures = 0
+            self._last_verified_lease = lease
         if lease is not None:
             try:
-                return self._sync_routes(lease, deadline=failover_deadline)
+                ready = self._sync_routes(lease, deadline=failover_deadline)
+                if ready or not self._health_switch:
+                    return ready
+                self._health_switch = False
+                self._health_failures = 0
+                skip_endpoint = _relay_endpoint(self._active_relay) if self._active_relay is not None else ""
+                self._set_status(
+                    KeeperPhase.SWITCHING,
+                    f"连续 {self._health_failure_limit()} 次 HTTPS 响应失败，开始有界节点切换",
+                )
+            except PlayProtectionActivated:
+                raise
             except Exception as exc:
                 self._set_status(KeeperPhase.FAILED, f"鉴权路由同步失败: {exc}")
                 return False
 
+        self._check_play_protection()
         try:
             self.routes.cleanup()
+        except PlayProtectionActivated:
+            raise
         except Exception as exc:
+            self._check_play_protection()
             self._set_status(KeeperPhase.FAILED, f"旧的临时路由无法安全清理: {exc}")
             return False
 
         # Release a half-open local session before consulting a fresh catalog.
+        self._check_play_protection()
         try:
             self.softether.disconnect(timeout=self._disconnect_timeout())
+        except PlayProtectionActivated:
+            raise
         except Exception as exc:
             self._logger(f"[warning] 连接前会话释放不完整: {exc}")
+        self._last_verified_lease = None
+        self._session_failures = 0
+        self._health_failures = 0
+        self._health_switch = False
 
         try:
             self._prepare_discovery()
@@ -308,13 +525,17 @@ class KeeperService:
             return False
 
         self._set_status(KeeperPhase.DISCOVERING, "正在刷新可用 CIS VPN Gate 节点")
+        self._check_play_protection()
         try:
-            candidates = self._candidates()
+            candidates = [relay for relay in self._candidates()
+                          if not skip_endpoint or _relay_endpoint(relay) != skip_endpoint]
+            candidates = candidates[:max(1, int(getattr(self.config, "max_candidates_total", 20)))]
         except Exception as exc:
             if self.machine.phase is ConnectionPhase.DISCOVERING:
                 self.machine.transition(ConnectionEvent.DISCOVERY_FAILED, reason=str(exc))
             self._set_status(KeeperPhase.RETRY_WAIT, f"节点目录读取失败: {exc}")
             return False
+        self._check_play_protection()
         if not candidates:
             if self.machine.phase is ConnectionPhase.DISCOVERING:
                 self.machine.no_candidates()
@@ -333,6 +554,7 @@ class KeeperService:
         for index, relay in enumerate(candidates, start=1):
             if self._stop_event.is_set():
                 return False
+            self._check_play_protection()
             endpoint = _relay_endpoint(relay)
             country = str(getattr(relay, "country_short", ""))
             remaining = failover_deadline - time.monotonic()
@@ -371,6 +593,7 @@ class KeeperService:
                     raise SoftEtherError("节点 TCP 端口不可达")
                 self.machine.tcp_connected()
                 while True:
+                    self._check_play_protection()
                     remaining = failover_deadline - time.monotonic()
                     if remaining <= 0:
                         raise _FailoverDeadlineExpired("本轮故障转移共享时限已耗尽")
@@ -421,6 +644,9 @@ class KeeperService:
                             ) from exc
                         raise
                 self.machine.session_established()
+                self._active_relay = relay
+            except PlayProtectionActivated:
+                raise
             except _FailoverDeadlineExpired as exc:
                 # A shared local time budget says nothing about whether this
                 # volunteer relay is healthy.  Reset the partial session and
@@ -437,7 +663,7 @@ class KeeperService:
                     failed_candidates=failures,
                 )
                 return False
-            except SoftEtherError as exc:
+            except (SoftEtherError, CommandError) as exc:
                 failures += 1
                 self._best_effort_reset()
                 if self.machine.phase in {
@@ -469,8 +695,14 @@ class KeeperService:
             try:
                 if self._sync_routes(lease, relay, deadline=failover_deadline):
                     return True
+                if self.health_probe is not None and self._health_failures:
+                    # Keep this session until independent later cycles confirm
+                    # failure; do not rotate on one backend response failure.
+                    return False
                 self._best_effort_reset()
                 return False
+            except PlayProtectionActivated:
+                raise
             except Exception as exc:
                 self._best_effort_reset()
                 self._set_status(KeeperPhase.FAILED, f"连接后路由同步失败: {exc}")
@@ -487,13 +719,23 @@ class KeeperService:
 
     def run_forever(self) -> None:
         self._stop_event.clear()
+        failed_cycles = 0
         while not self._stop_event.is_set():
             ready = self.run_cycle()
-            wait_seconds = (
-                int(getattr(self.config, "refresh_seconds", 30))
-                if ready
-                else int(getattr(self.config, "failed_cycle_retry_seconds", 10))
-            )
+            if ready:
+                failed_cycles = 0
+                wait_seconds = int(getattr(self.config, "refresh_seconds", 30))
+            elif self.machine.phase is ConnectionPhase.READY:
+                # A retained session is not a failed relay. Poll it at the
+                # normal interval so a transient probe/lease miss cannot cause
+                # a rapid disconnect/reconnect storm or NCSI browser popups.
+                failed_cycles = 0
+                wait_seconds = int(getattr(self.config, "refresh_seconds", 30))
+            else:
+                failed_cycles += 1
+                base = max(1, int(getattr(self.config, "failed_cycle_retry_seconds", 10)))
+                cap = self._failed_cycle_backoff_max()
+                wait_seconds = min(cap, base * (2 ** min(failed_cycles - 1, 8)))
             self._stop_event.wait(max(1, wait_seconds))
         self._set_status(KeeperPhase.STOPPED, "已停止")
 
@@ -531,23 +773,29 @@ class KeeperService:
             ConnectionPhase.DISCONNECTING,
         }:
             self.machine.disconnect()
+        # An explicit user stop is still allowed to release the owned session;
+        # only autonomous maintenance is suspended by the play guard.
+        self._explicit_cleanup = True
         try:
-            self.routes.cleanup(deadline=stop_deadline)
-        finally:
-            if disconnect:
-                remaining = stop_deadline - time.monotonic()
-                requested_disconnect_timeout = (
-                    remaining
-                    if disconnect_timeout is None
-                    else min(remaining, max(0.0, float(disconnect_timeout)))
-                )
-                if requested_disconnect_timeout < 0.1:
-                    raise RuntimeError(
-                        "keeper stop deadline expired before SoftEther disconnect"
+            try:
+                self.routes.cleanup(deadline=stop_deadline)
+            finally:
+                if disconnect:
+                    remaining = stop_deadline - time.monotonic()
+                    requested_disconnect_timeout = (
+                        remaining
+                        if disconnect_timeout is None
+                        else min(remaining, max(0.0, float(disconnect_timeout)))
                     )
-                self.softether.disconnect(
-                    timeout=requested_disconnect_timeout
-                )
+                    if requested_disconnect_timeout < 0.1:
+                        raise RuntimeError(
+                            "keeper stop deadline expired before SoftEther disconnect"
+                        )
+                    self.softether.disconnect(
+                        timeout=requested_disconnect_timeout
+                    )
+        finally:
+            self._explicit_cleanup = False
         if self.machine.phase is ConnectionPhase.DISCONNECTING:
             self.machine.disconnected()
         self._set_status(KeeperPhase.STOPPED, "已停止")
