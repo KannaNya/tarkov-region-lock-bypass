@@ -73,4 +73,3 @@
 3. 点击 Play：状态应从匹配阶段变为 `play_protected=true`，节点不应被切换。
 4. 在 Raid 中观察不会出现 SoftEther 断开、路由清理或候选节点轮换。
 5. 回到菜单并出现 `UserMatchOver`/`PostRaid` 后，保护解除，后台恢复正常维护。
-
