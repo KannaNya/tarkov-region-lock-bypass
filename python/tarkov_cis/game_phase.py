@@ -57,7 +57,10 @@ class GamePhaseSnapshot:
 _TIMESTAMP_RE = re.compile(
     r"^\ufeff?(?P<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)\|"
 )
-_SESSION_RE = re.compile(r"^log_(\d{4}\.\d{2}\.\d{2}_\d{2}-\d{2}-\d{2})(?:_|$)")
+_SESSION_RE = re.compile(
+    r"^log_(?P<date>\d{4}\.\d{2}\.\d{2})_"
+    r"(?P<hour>\d{1,2})-(?P<minute>\d{2})-(?P<second>\d{2})(?:_|$)"
+)
 _RAID_ENDPOINT_RE = re.compile(
     r"\bIp:\s*(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s*,\s*Port:\s*(?P<port>\d+)"
     r"|\"ip\"\s*:\s*\"(?P<json_ip>\d{1,3}(?:\.\d{1,3}){3})\"\s*,\s*\"port\"\s*:\s*(?P<json_port>\d+)",
@@ -121,7 +124,10 @@ def _session_id(path: Path) -> str:
     for parent in path.parents:
         match = _SESSION_RE.match(parent.name)
         if match:
-            return match.group(1)
+            return (
+                f"{match.group('date')}_{int(match.group('hour')):02d}-"
+                f"{match.group('minute')}-{match.group('second')}"
+            )
     return ""
 
 

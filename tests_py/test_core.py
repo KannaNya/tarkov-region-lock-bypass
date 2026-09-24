@@ -60,7 +60,7 @@ class ConfigTests(unittest.TestCase):
         config = AppConfig.load(ROOT / "config.example.json")
         self.assertEqual(config.task_name, "Tarkov-CIS-RouteKeeper")
         self.assertEqual(config.refresh_seconds, 30)
-        self.assertTrue(config.disconnect_at_raid)
+        self.assertFalse(config.disconnect_at_raid)
         self.assertEqual(config.failed_cycle_backoff_max_seconds, 10)
         self.assertEqual(config.cooling_fallback_minutes, 0)
         self.assertIn("gw-pvp.escapefromtarkov.ru", config.target_hosts)
@@ -201,6 +201,16 @@ remote 192.0.2.1 992 tcp
 
 
 class RelaySelectorTests(unittest.TestCase):
+    def test_reported_bandwidth_precedes_server_score(self) -> None:
+        slow = relay("192.0.2.10", 443, score=2000)
+        fast = relay("192.0.2.11", 443, score=1000)
+        from dataclasses import replace
+        ranked = select_relay_candidates(
+            [replace(slow, speed_mbps=20), replace(fast, speed_mbps=200)],
+            per_country_limit=2, total_limit=2,
+        )
+        self.assertEqual("192.0.2.11", ranked.candidates[0].ip)
+
     def test_stable_identity_country_round_robin_and_alternate_port_fallback(self) -> None:
         relays = [
             relay("192.0.2.10", 443),

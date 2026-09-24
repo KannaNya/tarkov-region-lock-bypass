@@ -17,10 +17,11 @@ def _country_key(country: str) -> tuple[int, str]:
     return (-COUNTRY_PRIORITIES.get(country, 0), country)
 
 
-def _relay_key(relay: Relay) -> tuple[int, int, int, int, str]:
+def _relay_key(relay: Relay) -> tuple[int, int, float, int, int, str]:
     return (
         -relay.source_priority,
         -(1 if relay.sessions > 0 else 0),
+        -relay.speed_mbps,
         -relay.score,
         relay.ping,
         relay.endpoint,

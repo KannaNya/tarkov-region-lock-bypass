@@ -115,9 +115,9 @@ class AppConfig:
     health_failure_threshold: int = 3
     session_failure_threshold: int = 3
     failed_cycle_backoff_max_seconds: int = 10
-    # Disconnect after the in-Raid GameStarted marker, never at character select.
+    # Keep the authenticated relay stable through Raid and post-Raid results.
     pause_during_raid: bool = True
-    disconnect_at_raid: bool = True
+    disconnect_at_raid: bool = False
     game_phase_max_age_days: int = 2
     game_phase_max_files: int = 24
     game_phase_max_bytes_per_file: int = 256 * 1024

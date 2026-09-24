@@ -30,7 +30,7 @@
 4. 将候选节点写入 SoftEther 账户 `Tarkov-CIS-PlayOnly`，并关闭 SoftEther 自身的无限重试。只有 `SID-*` 会话、正常虚拟网卡、非 APIPA IPv4 和 VPN 网关同时存在才会报告连接成功。
 5. Python Keeper 由显式状态机驱动，常驻任务持续检查会话、网卡、IPv4 地址、临时路由和普通默认出口。
 6. 当前节点失效时，删除本工具管理的旧路由并尝试下一个；一批候选均失败后每 10 秒刷新目录并重试，全部处于冷却期时每轮最多复测 3 个最早失败的独立中继。SoftEther 错误 43 属于本机资源忙，不会误伤远端候选节点。
-7. 默认 `DisconnectAtRaid=true`：登录、选角色、大厅和匹配阶段保持 SoftEther 连接与鉴权分流；只有本机游戏日志记录带时间戳的 `GameStarted:`，确认已经进入 Raid 后，才撤销本工具的 `/32` 路由并断开 SoftEther。当前游戏会话内不再重连，包括战局结算阶段；`UserMatchOver` 表示开始结算，不表示已经回到大厅。若显式设为 `false`，则使用旧的匹配/Raid 保持会话保护模式。旧配置项 `DisconnectAtMenu` 不再生效。
+7. 默认 `DisconnectAtRaid=false`：登录、选角色、大厅、Raid 和战局结算都保留同一个 SoftEther 会话。游戏进程运行且连接就绪后，后台暂停节点切换；`UserMatchOver` 表示开始结算，不会解锁节点切换。只把鉴权目标的 `/32` 路由送入 VPN，独立 Raid 服务器和默认网络仍走本地连接。此前手动设置过 `DisconnectAtRaid=true` 的配置需改为 `false`。
 8. 一轮故障转移默认最多运行 180 秒，并优先尝试不同 IP 的独立中继；候选按 CIS 国家轮询，先保证 RU 后的 UA/KZ/BY 等国家各有机会，再补齐同一国家的其他节点；同一中继的其他 SSL 端口只作为后备，不会挤占全部候选名额。
 9. 目标域名解析出的地址使用临时 `/32` 路由走 VPN；VPN 默认路由提高 metric，因此日本物理网卡仍是普通流量的默认出口。
 
@@ -66,7 +66,7 @@ Windows 路由按目标 IP 选择，不能按 URL 路径或进程区分流量。
 
 关闭 GUI 不会停止后台任务。首次启动会根据 `config.example.json` 自动创建本机专用的 `config.json`；该文件已被 Git 忽略。静态鉴权域名可直接工作；若要增加基于本机证据的 WSN 动态发现，可把 `GameLogRoots` 填为实际 `EscapeFromTarkov\Logs` 目录后重新启动任务。
 
-进入 Raid 后的断开依赖本机 EFT 日志中的 `GameStarted:` 标记；状态栏显示 `raid_direct` 才表示后台已确认撤销路由并断开 VPN。公共 VPN Gate 候选全都不可达时，10 秒重试也不能保证建立连接。
+节点列表中的 Mbps 是 VPN Gate 目录报告的线路速度，候选排序优先考虑该值，但它不能代替实际下载测速。游戏运行且连接就绪后，状态栏显示 `play_protected`，表示后台暂停节点切换。公共 VPN Gate 候选全都不可达时，10 秒重试也不能保证建立连接。
 
 ## 命令行方式
 

@@ -338,10 +338,15 @@ class KeeperService:
         return bool(getattr(self.config, "pause_during_raid", True))
 
     def _protect_active_raid(self, snapshot: GamePhaseSnapshot) -> bool:
-        """Freeze reconciliation once matching has begun and during a Raid."""
+        """Keep an established relay stable while the game process runs."""
 
         protected_phases = {GamePhase.MATCHMAKING, GamePhase.RAID, GamePhase.RAID_STARTED, GamePhase.POST_RAID}
-        if not self._raid_protection_enabled() or snapshot.phase not in protected_phases:
+        game_running_with_relay = (
+            snapshot.process_running is True and self.machine.phase is ConnectionPhase.READY
+        )
+        if not self._raid_protection_enabled() or (
+            snapshot.phase not in protected_phases and not game_running_with_relay
+        ):
             return False
         # A stale marker from an old log must not freeze a fresh login.  The
         # parser only marks protection active while the game process exists.
@@ -352,7 +357,7 @@ class KeeperService:
         self._session_failures = 0
         self._health_switch = False
         current = self.status
-        label = "Raid" if snapshot.phase in {GamePhase.RAID, GamePhase.RAID_STARTED} else "匹配"
+        label = "Raid" if snapshot.phase in {GamePhase.RAID, GamePhase.RAID_STARTED} else "游戏"
         self._set_status(
             KeeperPhase.PLAY_PROTECTED,
             f"{label}保护中：暂停节点切换（{snapshot.detail}）",

@@ -172,6 +172,18 @@ class GamePhaseDetectionTests(unittest.TestCase):
         self.assertEqual(GamePhase.UNKNOWN, snapshot.phase)
         self.assertEqual("2026.09.24_22-05-00", snapshot.session_id)
 
+    def test_unpadded_midnight_hour_is_current_launch(self):
+        old = Path(self.tmp.name) / "log_2026.09.24_23-59-57_1.0"
+        new = Path(self.tmp.name) / "log_2026.09.25_0-23-51_1.0"
+        old.mkdir()
+        new.mkdir()
+        (old / "application.log").write_text("2026-09-24 23:59:58.000|Debug|GameStarted:1\n")
+        (new / "application.log").write_text("2026-09-25 00:23:52.000|Info|Successful login\n")
+        snapshot = detect_game_phase([self.tmp.name], process_checker=lambda: True)
+        self.assertEqual("2026.09.25_00-23-51", snapshot.session_id)
+        self.assertEqual(GamePhase.LOGIN, snapshot.phase)
+        self.assertFalse(snapshot.raid_started_seen)
+
     def test_endpoint_is_carried_forward_chronologically_across_log_files(self):
         path = self._log("2026-09-24 22:01:00.000|Debug|GameStarted:1\n")
         early = Path(self.tmp.name) / "application.log"
@@ -299,6 +311,16 @@ class KeeperGameProtectionTests(unittest.TestCase):
         self.assertFalse(keeper.run_cycle())
         softether.verified_connection.assert_called_once()
         self.assertNotEqual(KeeperPhase.PLAY_PROTECTED, keeper.status.phase)
+
+    def test_ready_relay_stays_stable_from_game_launch_through_lobby(self):
+        keeper = self.service()
+        keeper.machine.session_restored()
+        keeper.machine.routes_applied()
+        self.snapshot = GamePhaseSnapshot(phase=GamePhase.LOGIN, process_running=True)
+        self.assertTrue(keeper.run_cycle())
+        self.assertEqual(KeeperPhase.PLAY_PROTECTED, keeper.status.phase)
+        self.softether.verified_connection.assert_not_called()
+        self.softether.disconnect.assert_not_called()
 
     def test_matching_starts_during_session_read_no_cleanup_follows(self):
         keeper = self.service()
@@ -443,7 +465,8 @@ class KeeperGameProtectionTests(unittest.TestCase):
                 self.snapshot = next_snapshot
                 self.assertTrue(keeper.run_cycle())
                 self.softether.verified_connection.assert_called_once()
-                self.assertEqual(KeeperPhase.READY, keeper.status.phase)
+                expected = KeeperPhase.PLAY_PROTECTED if next_snapshot.process_running else KeeperPhase.READY
+                self.assertEqual(expected, keeper.status.phase)
 
     def test_protection_can_be_disabled_explicitly(self):
         keeper = self.service()
