@@ -440,10 +440,11 @@ def _scheduled_task_info(task_name: str) -> dict[str, str]:
         "$t=Get-ScheduledTask -TaskName $env:TARKOV_CIS_TASK_NAME "
         "-ErrorAction SilentlyContinue;"
         "if($null -eq $t){"
-        "[pscustomobject]@{State='NotInstalled';Arguments=''}|ConvertTo-Json -Compress"
+        "[pscustomobject]@{State='NotInstalled';Arguments='';Execute=''}|ConvertTo-Json -Compress"
         "}else{"
         "$a=@($t.Actions|ForEach-Object{[string]$_.Arguments}) -join ' ';"
-        "[pscustomobject]@{State=[string]$t.State;Arguments=$a}|ConvertTo-Json -Compress}"
+        "$e=@($t.Actions|ForEach-Object{[string]$_.Execute}) -join ' ';"
+        "[pscustomobject]@{State=[string]$t.State;Arguments=$a;Execute=$e}|ConvertTo-Json -Compress}"
     )
     environment = os.environ.copy()
     environment["TARKOV_CIS_TASK_NAME"] = task_name
@@ -457,10 +458,12 @@ def _scheduled_task_info(task_name: str) -> dict[str, str]:
             raise RuntimeError("scheduled task query returned no data")
         payload = json.loads(result.stdout)
         arguments = str(payload.get("Arguments", "")).lower()
+        executables = str(payload.get("Execute", "")).lower()
         if (
             "python-task.ps1" in arguments
             or "tarkov-cis-python.py" in arguments
             or "tarkovcis.exe" in arguments
+            or "tarkovcis.exe" in executables
         ):
             implementation = "python"
         elif "tarkov-cisroutekeeper.ps1" in arguments:

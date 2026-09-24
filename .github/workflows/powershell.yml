@@ -28,6 +28,8 @@ jobs:
 
   python:
     runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python 3.13

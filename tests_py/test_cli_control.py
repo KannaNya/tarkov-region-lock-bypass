@@ -309,6 +309,22 @@ class CliControlTests(unittest.TestCase):
         self.assertIn("refusing to overwrite it", script)
         self.assertIn("refusing to stop it", script)
 
+    def test_task_info_recognizes_frozen_executable_action(self):
+        if os.name != "nt":
+            self.skipTest("Windows Task Scheduler is required")
+        payload = {
+            "State": "Running",
+            "Arguments": '"run" "--config" "C:\\Release\\config.json"',
+            "Execute": "C:\\Release\\TarkovCIS.exe",
+        }
+        with patch("tarkov_cis.cli.run_command") as run:
+            run.return_value = SimpleNamespace(ok=True, stdout=json.dumps(payload))
+            self.assertEqual(
+                {"state": "Running", "implementation": "python"},
+                cli._scheduled_task_info("Tarkov-CIS-RouteKeeper"),
+            )
+            self.assertIn("Execute", run.call_args.args[0][-1])
+
     def test_task_wrapper_recognizes_current_moved_and_unknown_actions(self):
         shell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
         if shell is None:
@@ -357,12 +373,27 @@ $unknown = [pscustomobject]@{
 }
 $direct = [pscustomobject]@{
     Actions = @([pscustomobject]@{
+        Execute = 'C:\Windows\py.exe'
         Arguments = '"-3" "C:\Release-B\Tarkov-CIS-Python.py" "run" "--config" "C:\Release-B\config.json"'
+    })
+}
+$movedDirect = [pscustomobject]@{
+    Actions = @([pscustomobject]@{
+        Execute = 'C:\Windows\py.exe'
+        Arguments = '"-3" "C:\Release-A\Tarkov-CIS-Python.py" "run" "--config" "C:\Release-A\config.json"'
+    })
+}
+$frozen = [pscustomobject]@{
+    Actions = @([pscustomobject]@{
+        Execute = 'C:\Release-B\TarkovCIS.exe'
+        Arguments = '"run" "--config" "C:\Release-B\config.json"'
     })
 }
 [pscustomobject]@{
     SameIsCurrent = Test-TaskUsesThisWrapper -Task $same
     DirectIsCurrent = Test-TaskUsesThisWrapper -Task $direct
+    MovedDirectIsCurrent = Test-TaskUsesThisWrapper -Task $movedDirect
+    FrozenIsCurrent = Test-TaskUsesThisWrapper -Task $frozen
     MovedPath = Get-PythonWrapperPath -Task $moved
     MovedIsCurrent = Test-TaskUsesThisWrapper -Task $moved
     UnknownPath = Get-PythonWrapperPath -Task $unknown
@@ -382,6 +413,8 @@ $direct = [pscustomobject]@{
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertTrue(payload["SameIsCurrent"])
         self.assertTrue(payload["DirectIsCurrent"])
+        self.assertTrue(payload["MovedDirectIsCurrent"])
+        self.assertTrue(payload["FrozenIsCurrent"])
         self.assertEqual(
             r"C:\Release-A\scripts\python-task.ps1", payload["MovedPath"]
         )

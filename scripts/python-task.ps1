@@ -188,16 +188,18 @@ function Test-TaskUsesThisWrapper {
 function Test-TaskUsesDirectPythonRuntime {
     param([Parameter(Mandatory = $true)]$Task)
 
-    $sourceEntry = [regex]::Escape((Join-Path $projectRoot 'Tarkov-CIS-Python.py'))
-    $sourceExe = [regex]::Escape((Join-Path $projectRoot 'TarkovCIS.exe'))
-    $bundleExe = [regex]::Escape((Join-Path $projectRoot 'dist\TarkovCIS\TarkovCIS.exe'))
     foreach ($action in @($Task.Actions)) {
         $arguments = [string]$action.Arguments
         $isRun = $arguments -match '(?i)(?:^|\s)"?run"?(?:\s|$)'
         if (-not $isRun) { continue }
-        if ($arguments -match $sourceEntry -or
-            $arguments -match $sourceExe -or
-            $arguments -match $bundleExe) {
+        $executableName = [IO.Path]::GetFileName([string]$action.Execute)
+        if ($executableName -ieq 'TarkovCIS.exe' -and
+            $arguments -match '(?i)^\s*"?run"?(?:\s|$)' -and
+            $arguments -match '(?i)(?:^|\s)"?--config"?(?:\s|$)') {
+            return $true
+        }
+        if ($executableName -in @('py.exe', 'python.exe', 'pythonw.exe') -and
+            $arguments -match '(?i)(?:^|\s)"?[^\"]*[/\\]Tarkov-CIS-Python\.py"?\s+"?run"?(?:\s|$)') {
             return $true
         }
     }
