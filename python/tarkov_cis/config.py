@@ -19,7 +19,7 @@ _FIELD_ALIASES = {
     "session_failure_threshold": "SessionFailureThreshold",
     "failed_cycle_backoff_max_seconds": "FailedCycleBackoffMaxSeconds",
     "pause_during_raid": "PauseDuringRaid",
-    "disconnect_at_menu": "DisconnectAtMenu",
+    "disconnect_at_raid": "DisconnectAtRaid",
     "game_phase_max_age_days": "GamePhaseMaxAgeDays",
     "game_phase_max_files": "GamePhaseMaxFiles",
     "game_phase_max_bytes_per_file": "GamePhaseMaxBytesPerFile",
@@ -115,9 +115,9 @@ class AppConfig:
     health_failure_threshold: int = 3
     session_failure_threshold: int = 3
     failed_cycle_backoff_max_seconds: int = 10
-    # The legacy play guard is used only when disconnect_at_menu is disabled.
+    # Disconnect after the in-Raid GameStarted marker, never at character select.
     pause_during_raid: bool = True
-    disconnect_at_menu: bool = True
+    disconnect_at_raid: bool = True
     game_phase_max_age_days: int = 2
     game_phase_max_files: int = 24
     game_phase_max_bytes_per_file: int = 256 * 1024
@@ -214,9 +214,9 @@ class AppConfig:
             _read_value(data, "pause_during_raid", getattr(defaults, "pause_during_raid")),
             "pause_during_raid",
         )
-        values["disconnect_at_menu"] = _bool(
-            _read_value(data, "disconnect_at_menu", getattr(defaults, "disconnect_at_menu")),
-            "disconnect_at_menu",
+        values["disconnect_at_raid"] = _bool(
+            _read_value(data, "disconnect_at_raid", getattr(defaults, "disconnect_at_raid")),
+            "disconnect_at_raid",
         )
         values["failed_cycle_retry_seconds"] = max(5, values["failed_cycle_retry_seconds"])
         values["disconnected_poll_seconds"] = max(1, values["disconnected_poll_seconds"])

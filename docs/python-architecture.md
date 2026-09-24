@@ -42,7 +42,7 @@ relay_selector  process_runner  Windows ActiveStore
 7. 所有外部命令必须有超时，失败必须携带命令名、退出码与可审计信息。
 8. PID、操作 token、进程创建时间和随机 generation 必须共同匹配；旧世代状态只标记为 stale，不得伪装成当前 `READY`。
 9. 停止失败时保留所有权记录并保持单实例锁，直到工作线程结束；不得为了让界面显示“已停止”而与仍在执行的路由操作竞态。
-10. 默认登录专用模式在首次检测到大厅、匹配或 Raid 时撤销自有路由并断开 SoftEther，同一游戏会话内不再重连；旧的匹配/Raid 保持会话保护只在 `DisconnectAtMenu=false` 时启用。
+10. 默认模式在登录、选角、大厅和匹配时保持鉴权路由与 SoftEther 会话；只有带时间戳的 `GameStarted:` 证明进入 Raid 后才撤销自有路由并断开 SoftEther，同一游戏会话内不再重连。`MainMenuShowOperation` 常出现在错误堆栈中，不作为断开依据；旧的匹配/Raid 保持会话保护只在 `DisconnectAtRaid=false` 时启用。
 
 ## 发布方式
 

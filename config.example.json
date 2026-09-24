@@ -13,7 +13,7 @@
   "SessionFailureThreshold": 3,
   "FailedCycleBackoffMaxSeconds": 10,
   "PauseDuringRaid": true,
-  "DisconnectAtMenu": true,
+  "DisconnectAtRaid": true,
   "GamePhaseMaxAgeDays": 2,
   "GamePhaseMaxFiles": 24,
   "GamePhaseMaxBytesPerFile": 262144,

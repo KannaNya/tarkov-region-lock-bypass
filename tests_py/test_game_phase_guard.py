@@ -72,7 +72,7 @@ class GamePhaseDetectionTests(unittest.TestCase):
         snapshot = detect_game_phase(
             [self.tmp.name], process_checker=lambda: True
         )
-        self.assertEqual(GamePhase.RAID, snapshot.phase)
+        self.assertEqual(GamePhase.RAID_STARTED, snapshot.phase)
         self.assertEqual(("95.1.2.3", 17014), (snapshot.raid_ip, snapshot.raid_port))
 
         self._log(
@@ -120,13 +120,32 @@ class GamePhaseDetectionTests(unittest.TestCase):
         application = Path(self.tmp.name) / "application.log"
         application.write_text("2026-09-24 22:00:00.000|Debug|application|GameStarted:1\n")
         snapshot = detect_game_phase([self.tmp.name], process_checker=lambda: True)
-        self.assertEqual(GamePhase.RAID, snapshot.phase)
+        self.assertEqual(GamePhase.RAID_STARTED, snapshot.phase)
         self.assertEqual(0, snapshot.observed_at.microsecond)
 
     def test_partial_stack_at_tail_start_cannot_unlock_raid(self):
         self._log("EFT.MainMenuShowOperation:Execute()\n2026-09-24 22:02:00.000|Info|noise\n")
         (Path(self.tmp.name) / "application.log").write_text(
             "2026-09-24 22:00:00.000|Debug|GameStarted:1\n"
+        )
+        snapshot = detect_game_phase([self.tmp.name], process_checker=lambda: True)
+        self.assertEqual(GamePhase.RAID_STARTED, snapshot.phase)
+
+    def test_menu_stack_during_character_authorization_is_not_lobby_ready(self):
+        self._log(
+            "2026-09-24 22:00:00.000|Info|output|ShowCharacterSelectionScreen\n"
+            "2026-09-24 22:01:00.000|Warn|output|Quest condition unavailable\n"
+            "EFT.MainMenuShowOperation:Init()\n"
+            "EFT.MainMenuShowOperation:Execute()\n"
+        )
+        snapshot = detect_game_phase([self.tmp.name], process_checker=lambda: True)
+        self.assertEqual(GamePhase.CHARACTER_SELECT, snapshot.phase)
+
+    def test_gamestarted_stack_frame_is_not_raid_entry(self):
+        self._log(
+            "2026-09-24 22:00:00.000|Info|output|TRACE-NetworkGameCreate\n"
+            "2026-09-24 22:01:00.000|Warn|output|unrelated warning\n"
+            "EFT.GameStarted:MoveNext()\n"
         )
         snapshot = detect_game_phase([self.tmp.name], process_checker=lambda: True)
         self.assertEqual(GamePhase.RAID, snapshot.phase)
@@ -157,7 +176,7 @@ class GamePhaseDetectionTests(unittest.TestCase):
         self.assertIsNone(is_eft_process_running(runner=runner))
         self._log("2026-09-24 22:00:00.000|Debug|GameStarted:1\n")
         snapshot = detect_game_phase([self.tmp.name], process_checker=lambda: None)
-        self.assertEqual(GamePhase.RAID, snapshot.phase)
+        self.assertEqual(GamePhase.RAID_STARTED, snapshot.phase)
         self.assertIsNone(snapshot.process_running)
 
     def test_repeated_boundary_checks_reuse_unchanged_logs_but_see_new_bytes(self):
@@ -434,57 +453,81 @@ class KeeperGameProtectionTests(unittest.TestCase):
         self.assertEqual(ConnectionPhase.READY, keeper.machine.phase)
 
 
-class LoginOnlyTests(unittest.TestCase):
+class RaidDisconnectTests(unittest.TestCase):
     def service(self, snapshot):
         self.snapshot = snapshot
         self.softether = MagicMock()
         self.softether.disconnect.return_value = True
+        self.softether.verified_connection.return_value = LEASE
         self.routes = MagicMock()
         self.provider = MagicMock(return_value=[])
         self.keeper = KeeperService(
-            config=SimpleNamespace(disconnect_at_menu=True, pause_during_raid=True),
+            config=SimpleNamespace(disconnect_at_raid=True, pause_during_raid=True),
             candidate_provider=self.provider, softether=self.softether,
             routes=self.routes, game_phase_probe=lambda: self.snapshot,
         )
+        self.keeper._authorization_targets = lambda: TARGETS
         return self.keeper
 
-    def test_menu_disconnects_once_and_keeps_vpn_off(self):
+    def test_menu_and_character_selection_keep_vpn_connected(self):
         keeper = self.service(GamePhaseSnapshot(
             phase=GamePhase.MENU, detail="MainMenu", process_running=True,
             session_id="launch-a",
         ))
         keeper.machine.session_restored()
         self.assertTrue(keeper.run_cycle())
-        self.assertEqual(ConnectionPhase.DISCONNECTED, keeper.machine.phase)
-        self.assertEqual(KeeperPhase.LOGIN_COMPLETE, keeper.status.phase)
-        self.routes.cleanup.assert_called_once()
-        self.softether.disconnect.assert_called_once()
-        self.provider.assert_not_called()
+        self.assertEqual(KeeperPhase.READY, keeper.status.phase)
+        self.softether.disconnect.assert_not_called()
+        self.snapshot = GamePhaseSnapshot(phase=GamePhase.CHARACTER_SELECT,
+                                          process_running=True, session_id="launch-a")
         self.assertTrue(keeper.run_cycle())
-        self.softether.disconnect.assert_called_once()
-        self.snapshot = GamePhaseSnapshot(phase=GamePhase.RAID, process_running=True,
-                                          session_id="launch-a")
-        self.assertTrue(keeper.run_cycle())
+        self.softether.disconnect.assert_not_called()
         self.provider.assert_not_called()
 
-    def test_menu_during_probe_aborts_connection_and_cleans_up(self):
+    def test_matching_and_pre_raid_keep_vpn_connected(self):
+        keeper = self.service(GamePhaseSnapshot(phase=GamePhase.MATCHMAKING,
+                                               process_running=True, session_id="launch-a"))
+        self.assertTrue(keeper.run_cycle())
+        self.snapshot = GamePhaseSnapshot(phase=GamePhase.RAID,
+                                          process_running=True, session_id="launch-a")
+        self.assertTrue(keeper.run_cycle())
+        self.assertEqual(KeeperPhase.PLAY_PROTECTED, keeper.status.phase)
+        self.softether.disconnect.assert_not_called()
+        self.provider.assert_not_called()
+
+    def test_game_started_disconnects_once_and_keeps_vpn_off(self):
+        keeper = self.service(GamePhaseSnapshot(
+            phase=GamePhase.RAID_STARTED, detail="GameStarted", process_running=True,
+            session_id="launch-a",
+        ))
+        keeper.machine.session_restored()
+        self.assertTrue(keeper.run_cycle())
+        self.assertEqual(ConnectionPhase.DISCONNECTED, keeper.machine.phase)
+        self.assertEqual(KeeperPhase.RAID_DIRECT, keeper.status.phase)
+        self.routes.cleanup.assert_called_once()
+        self.softether.disconnect.assert_called_once()
+        self.assertTrue(keeper.run_cycle())
+        self.softether.disconnect.assert_called_once()
+        self.provider.assert_not_called()
+
+    def test_game_started_during_probe_aborts_connection_and_cleans_up(self):
         keeper = self.service(LOGIN)
         self.softether.verified_connection.return_value = None
         self.provider.return_value = [RELAY]
 
-        def enter_menu(*_args, **_kwargs):
-            self.snapshot = GamePhaseSnapshot(phase=GamePhase.MENU,
+        def enter_raid(*_args, **_kwargs):
+            self.snapshot = GamePhaseSnapshot(phase=GamePhase.RAID_STARTED,
                                               process_running=True, session_id="launch-a")
             return True
 
-        self.softether.probe_tcp.side_effect = enter_menu
+        self.softether.probe_tcp.side_effect = enter_raid
         self.assertTrue(keeper.run_cycle())
         self.softether.connect.assert_not_called()
-        self.assertEqual(KeeperPhase.LOGIN_COMPLETE, keeper.status.phase)
+        self.assertEqual(KeeperPhase.RAID_DIRECT, keeper.status.phase)
         self.assertEqual(ConnectionPhase.DISCONNECTED, keeper.machine.phase)
 
     def test_game_exit_reopens_login_window(self):
-        keeper = self.service(GamePhaseSnapshot(phase=GamePhase.MENU,
+        keeper = self.service(GamePhaseSnapshot(phase=GamePhase.RAID_STARTED,
                                                 process_running=True, session_id="launch-a"))
         self.assertTrue(keeper.run_cycle())
         self.snapshot = GamePhaseSnapshot(process_running=False, session_id="launch-a")
@@ -492,15 +535,15 @@ class LoginOnlyTests(unittest.TestCase):
         self.assertFalse(keeper.run_cycle())
         self.provider.assert_called_once()
 
-    def test_failed_menu_cleanup_retries_without_discovery(self):
-        keeper = self.service(GamePhaseSnapshot(phase=GamePhase.MENU,
+    def test_failed_raid_cleanup_retries_without_discovery(self):
+        keeper = self.service(GamePhaseSnapshot(phase=GamePhase.RAID_STARTED,
                                                 process_running=True, session_id="launch-a"))
         self.softether.disconnect.side_effect = [False, True]
         self.assertFalse(keeper.run_cycle())
         self.assertEqual(KeeperPhase.FAILED, keeper.status.phase)
         self.provider.assert_not_called()
         self.assertTrue(keeper.run_cycle())
-        self.assertEqual(KeeperPhase.LOGIN_COMPLETE, keeper.status.phase)
+        self.assertEqual(KeeperPhase.RAID_DIRECT, keeper.status.phase)
         self.assertEqual(2, self.softether.disconnect.call_count)
 
 class AdapterPlayProtectionTests(unittest.TestCase):

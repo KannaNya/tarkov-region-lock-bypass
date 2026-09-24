@@ -27,6 +27,7 @@ class GamePhase(str, Enum):
     CHARACTER_SELECT = "character_select"
     MATCHMAKING = "matchmaking"
     RAID = "raid"
+    RAID_STARTED = "raid_started"
     MENU = "menu"
     POST_RAID = "post_raid"
 
@@ -35,8 +36,8 @@ class PlayProtectionActivated(RuntimeError):
     """Unwind maintenance without running failure cleanup during a Raid."""
 
 
-class LoginWindowClosed(PlayProtectionActivated):
-    """Stop in-flight VPN work when the game has left the login window."""
+class RaidStarted(PlayProtectionActivated):
+    """Stop in-flight VPN work after the game reports GameStarted."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,13 +155,13 @@ def _event(line: str) -> tuple[GamePhase, str, str, int] | None:
     if "trace-networkgamecreate" in lowered or "tracenetworkgamecreate" in lowered or "networkgamesession.gamestarted" in lowered:
         ip, port = _endpoint(line)
         return GamePhase.RAID, "NetworkGameCreate：Raid 会话已建立", ip, port
-    if re.search(r"\bgame\s*started\s*:", lowered) or "gamestarted()" in lowered:
+    if _TIMESTAMP_RE.match(line) and re.search(r"\bgame\s*started\s*:", lowered):
         ip, port = _endpoint(line)
-        return GamePhase.RAID, "GameStarted：已进入 Raid", ip, port
+        return GamePhase.RAID_STARTED, "GameStarted：已进入 Raid", ip, port
     if "postraid." in lowered or "gameoversavestatusreceived" in lowered:
         return GamePhase.POST_RAID, "PostRaid：正在保存 Raid 结果", "", 0
-    if "mainmenushowoperation" in lowered or "=== menu load profile ===" in lowered:
-        return GamePhase.MENU, "MainMenu：游戏菜单", "", 0
+    # MainMenuShowOperation occurs repeatedly in warning stack traces while
+    # profile authorization is still running. It cannot prove lobby readiness.
     return None
 
 
@@ -228,14 +229,14 @@ def detect_game_phase(
         return GamePhaseSnapshot(process_running=process_running, session_id=session_id)
     latest_raid_endpoint = ("", 0)
     for occurred, _, _, phase, detail, raid_ip, raid_port in sorted(events):
-        if phase is GamePhase.RAID:
+        if phase in {GamePhase.RAID, GamePhase.RAID_STARTED}:
             if raid_ip:
                 latest_raid_endpoint = (raid_ip, raid_port)
             else:
                 raid_ip, raid_port = latest_raid_endpoint
         elif phase is not GamePhase.UNKNOWN:
             latest_raid_endpoint = ("", 0)
-    if phase in {GamePhase.MATCHMAKING, GamePhase.RAID}:
+    if phase in {GamePhase.MATCHMAKING, GamePhase.RAID, GamePhase.RAID_STARTED}:
         # A new game process can coexist with yesterday's log directory while
         # Unity is still opening a fresh file.  Do not let that stale marker
         # freeze relay maintenance indefinitely.

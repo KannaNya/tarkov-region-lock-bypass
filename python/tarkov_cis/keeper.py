@@ -10,7 +10,7 @@ import time
 from typing import Any, Callable, Iterable
 
 from .eft_logs import discover_authorization_hosts, resolve_authorization_targets
-from .game_phase import GamePhase, GamePhaseSnapshot, LoginWindowClosed, PlayProtectionActivated
+from .game_phase import GamePhase, GamePhaseSnapshot, RaidStarted, PlayProtectionActivated
 from .models import ConnectionPhase
 from .process_runner import CommandError
 from .routing import RouteManager
@@ -26,7 +26,7 @@ class KeeperPhase(str, Enum):
     APPLYING_ROUTES = "applying_routes"
     READY = "ready"
     PLAY_PROTECTED = "play_protected"
-    LOGIN_COMPLETE = "login_complete"
+    RAID_DIRECT = "raid_direct"
     SWITCHING = "switching"
     RETRY_WAIT = "retry_wait"
     FAILED = "failed"
@@ -101,7 +101,7 @@ class KeeperService:
         self._health_switch = False
         self._active_relay = None
         self._last_game_phase = GamePhaseSnapshot()
-        self._login_closed_session: str | None = None
+        self._raid_direct_session: str | None = None
         self._explicit_cleanup = False
         # Guard individual adapter commands too: connect()/sync() may perform
         # several destructive operations after a slow preceding command.
@@ -254,7 +254,7 @@ class KeeperService:
         )
         if (
             same_session
-            and previous.phase in {GamePhase.MATCHMAKING, GamePhase.RAID}
+            and previous.phase in {GamePhase.MATCHMAKING, GamePhase.RAID, GamePhase.RAID_STARTED}
             and previous.process_running is not False
             and snapshot.process_running is not False
             and (
@@ -276,27 +276,27 @@ class KeeperService:
         if self._explicit_cleanup:
             return
         snapshot = self._game_phase()
-        if self._disconnect_at_menu() and self._login_finished(snapshot):
-            raise LoginWindowClosed()
+        if self._disconnect_at_raid() and self._raid_has_started(snapshot):
+            raise RaidStarted()
         if self._protect_active_raid(snapshot):
             raise PlayProtectionActivated()
 
-    def _disconnect_at_menu(self) -> bool:
-        return bool(getattr(self.config, "disconnect_at_menu", False))
+    def _disconnect_at_raid(self) -> bool:
+        return bool(getattr(self.config, "disconnect_at_raid", False))
 
-    def _login_finished(self, snapshot: GamePhaseSnapshot) -> bool:
+    def _raid_has_started(self, snapshot: GamePhaseSnapshot) -> bool:
         if snapshot.process_running is False:
-            self._login_closed_session = None
+            self._raid_direct_session = None
             return False
-        if (self._login_closed_session not in (None, "current-game") and snapshot.session_id
-                and snapshot.session_id != self._login_closed_session):
-            self._login_closed_session = None
-        return self._login_closed_session is not None or snapshot.phase in {
-            GamePhase.MENU, GamePhase.POST_RAID, GamePhase.MATCHMAKING, GamePhase.RAID,
-        }
+        if (self._raid_direct_session not in (None, "current-game") and snapshot.session_id
+                and snapshot.session_id != self._raid_direct_session):
+            self._raid_direct_session = None
+        return self._raid_direct_session is not None or (
+            snapshot.process_running is True and snapshot.phase is GamePhase.RAID_STARTED
+        )
 
-    def _end_login(self, snapshot: GamePhaseSnapshot) -> bool:
-        if self._login_closed_session is not None:
+    def _enter_raid_direct(self, snapshot: GamePhaseSnapshot) -> bool:
+        if self._raid_direct_session is not None:
             return True
         errors: list[str] = []
         self._explicit_cleanup = True
@@ -313,7 +313,7 @@ class KeeperService:
         finally:
             self._explicit_cleanup = False
         if errors:
-            self._set_status(KeeperPhase.FAILED, "登录结束后的清理失败: " + "; ".join(errors),
+            self._set_status(KeeperPhase.FAILED, "进入 Raid 后清理失败: " + "; ".join(errors),
                              game_phase=snapshot.phase.value, game_evidence=snapshot.detail)
             return False
         if self.machine.phase is not ConnectionPhase.DISCONNECTED:
@@ -327,8 +327,8 @@ class KeeperService:
         self._health_failures = 0
         self._session_failures = 0
         self._health_switch = False
-        self._login_closed_session = snapshot.session_id or "current-game"
-        self._set_status(KeeperPhase.LOGIN_COMPLETE, "已进入游戏大厅/游玩阶段；鉴权路由已撤销，VPN 已断开",
+        self._raid_direct_session = snapshot.session_id or "current-game"
+        self._set_status(KeeperPhase.RAID_DIRECT, "已进入 Raid；鉴权路由已撤销，VPN 已断开",
                          game_phase=snapshot.phase.value, game_evidence=snapshot.detail,
                          play_protected=False, relay="", country="", vpn_ipv4="", target_count=0)
         return True
@@ -339,7 +339,7 @@ class KeeperService:
     def _protect_active_raid(self, snapshot: GamePhaseSnapshot) -> bool:
         """Freeze reconciliation once matching has begun and during a Raid."""
 
-        protected_phases = {GamePhase.MATCHMAKING, GamePhase.RAID}
+        protected_phases = {GamePhase.MATCHMAKING, GamePhase.RAID, GamePhase.RAID_STARTED}
         if not self._raid_protection_enabled() or snapshot.phase not in protected_phases:
             return False
         # A stale marker from an old log must not freeze a fresh login.  The
@@ -351,7 +351,7 @@ class KeeperService:
         self._session_failures = 0
         self._health_switch = False
         current = self.status
-        label = "Raid" if snapshot.phase is GamePhase.RAID else "匹配"
+        label = "Raid" if snapshot.phase in {GamePhase.RAID, GamePhase.RAID_STARTED} else "匹配"
         self._set_status(
             KeeperPhase.PLAY_PROTECTED,
             f"{label}保护中：暂停节点切换（{snapshot.detail}）",
@@ -476,8 +476,8 @@ class KeeperService:
 
         try:
             return self._run_cycle()
-        except LoginWindowClosed:
-            return self._end_login(self._game_phase())
+        except RaidStarted:
+            return self._enter_raid_direct(self._game_phase())
         except PlayProtectionActivated:
             # This is a successful pause, not a relay failure.  In particular,
             # do not route it through reset()/disconnect() exception handlers.
@@ -487,8 +487,8 @@ class KeeperService:
 
         snapshot = self._game_phase()
         self._last_game_phase = snapshot
-        if self._disconnect_at_menu() and self._login_finished(snapshot):
-            return self._end_login(snapshot)
+        if self._disconnect_at_raid() and self._raid_has_started(snapshot):
+            return self._enter_raid_direct(snapshot)
         if self._protect_active_raid(snapshot):
             # Do not call verified_connection(), DNS, HTTPS health probes,
             # route cleanup, disconnect(), or candidate discovery here.  The
@@ -786,8 +786,8 @@ class KeeperService:
             if ready:
                 failed_cycles = 0
                 wait_seconds = int(getattr(self.config, "refresh_seconds", 30))
-                if self._disconnect_at_menu() and self.status.phase in {
-                    KeeperPhase.READY, KeeperPhase.LOGIN_COMPLETE,
+                if self._disconnect_at_raid() and self.status.phase in {
+                    KeeperPhase.READY, KeeperPhase.RAID_DIRECT,
                 }:
                     wait_seconds = min(wait_seconds, int(getattr(self.config, "disconnected_poll_seconds", 5)))
             elif self.machine.phase is ConnectionPhase.READY and self.status.phase is not KeeperPhase.FAILED:

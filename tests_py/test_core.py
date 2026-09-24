@@ -60,7 +60,7 @@ class ConfigTests(unittest.TestCase):
         config = AppConfig.load(ROOT / "config.example.json")
         self.assertEqual(config.task_name, "Tarkov-CIS-RouteKeeper")
         self.assertEqual(config.refresh_seconds, 30)
-        self.assertTrue(config.disconnect_at_menu)
+        self.assertTrue(config.disconnect_at_raid)
         self.assertEqual(config.failed_cycle_backoff_max_seconds, 10)
         self.assertEqual(config.cooling_fallback_minutes, 0)
         self.assertIn("gw-pvp.escapefromtarkov.ru", config.target_hosts)
