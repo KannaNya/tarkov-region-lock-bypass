@@ -1,7 +1,7 @@
 Option Explicit
 
 Dim shell, shellApplication, fileSystem, projectRoot, configPath
-Dim candidate, executablePath, sourceEntry, pythonPath, legacyScript, probeMode
+Dim candidate, executablePath, sourceEntry, pythonPath, probeMode
 
 Set shell = CreateObject("WScript.Shell")
 Set shellApplication = CreateObject("Shell.Application")
@@ -106,14 +106,5 @@ If Len(executablePath) > 0 Then
     WScript.Quit 0
 End If
 
-' Compatibility fallback for an older checkout without a packaged executable
-' or Python runtime.
-legacyScript = fileSystem.BuildPath(projectRoot, "src\Tarkov-CisGui.ps1")
-If fileSystem.FileExists(legacyScript) Then
-    executablePath = shell.ExpandEnvironmentStrings("%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe")
-    LaunchElevated executablePath, "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File " & QuoteArgument(legacyScript) & " -ConfigPath " & QuoteArgument(configPath)
-    WScript.Quit 0
-End If
-
-Call MsgBox("TarkovCIS.exe, Python 3, and the legacy PowerShell GUI were not found. Download the complete Windows release bundle.", vbCritical, "Tarkov CIS Split Route")
+Call MsgBox("TarkovCIS.exe and Python 3 were not found. Download the complete Windows release bundle.", vbCritical, "Tarkov CIS Split Route")
 WScript.Quit 1

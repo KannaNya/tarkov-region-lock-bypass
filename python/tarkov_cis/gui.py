@@ -140,33 +140,16 @@ def _format_status(value: Any) -> str:
         return "状态：" + value.strip()
     if isinstance(value, Mapping):
         parts: list[str] = []
-        if value.get("task_state"):
-            task_state = str(value["task_state"])
-            parts.append(f"任务 {task_state}")
-        if value.get("task_implementation") == "legacy-powershell":
-            parts.append("旧版 PowerShell（点击启动可迁移）")
-        if "keeper_running" in value:
-            parts.append("后台运行中" if value["keeper_running"] else "后台未运行")
-        if value.get("status_stale"):
-            parts.append("旧状态已忽略")
-        if value.get("connection_phase"):
-            parts.append(str(value["connection_phase"]))
+        if not value.get("task_installed", True):
+            parts.append("计划任务未安装")
+        parts.append("后台运行中" if value.get("keeper_running") else "后台未运行")
         if value.get("detail"):
             parts.append(str(value["detail"]))
-        if value.get("game_phase"):
-            phase = str(value["game_phase"])
-            parts.append("Raid 保护中" if value.get("play_protected") else f"游戏阶段 {phase}")
-        if value.get("vpn_probe_paused"):
-            parts.append("VPN 探测已暂停（保留现有会话）")
-        elif "vpn_verified" in value:
-            parts.append("VPN 已验证" if value["vpn_verified"] else "VPN 未连接")
-        if value.get("vpn_ipv4"):
-            parts.append(f"VPN {value['vpn_ipv4']}")
-        if "managed_authorization_routes" in value:
-            parts.append(f"已记录鉴权路由 {value['managed_authorization_routes']} 条")
-        if parts:
-            return "状态：" + "｜".join(parts)
-        return "状态：" + "｜".join(f"{key}={item}" for key, item in value.items())
+        if value.get("relay"):
+            parts.append(f"节点 {value.get('country', '')} {value['relay']}".replace("  ", " "))
+        parts.append(f"VPN {value['vpn_ipv4']}" if value.get("vpn_ipv4") else "VPN 未连接")
+        parts.append(f"鉴权路由 {value.get('route_count', 0)} 条")
+        return "状态：" + "｜".join(parts)
     return "状态：" + str(value)
 
 

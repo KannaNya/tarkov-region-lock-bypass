@@ -6,7 +6,12 @@ The keeper operates at the IPv4 destination-route layer:
 Tarkov backend hostname -> current A records -> host /32 -> SoftEther VPN
 ordinary destinations -> physical default route -> Japan ISP
 Raid server IP/UDP -> no special route -> Japan ISP
+SoftEther DHCP default route -> VPN interface metric 9000 -> never selected
 ```
+
+The VPN adapter's interface metric is pinned to 9000, so the default route
+SoftEther's DHCP installs always loses to the physical adapter, even when it
+is re-added during a match while the keeper deliberately touches nothing.
 
 The host set should come from current Launcher/EFT logs and DNS. In the observed flow, `gw-pvp`, `gw-pvp-season`, `lobby`, and `wsn-pvp-season-*` were involved around launch, profile selection, and second authorization. Shared IPs mean the route cannot distinguish individual URL paths.
 

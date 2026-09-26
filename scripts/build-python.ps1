@@ -93,11 +93,6 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md') -Destination $bundle
 Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $bundleRoot -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'Tarkov-CIS-GUI.cmd') -Destination $bundleRoot -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'Tarkov-CIS-GUI.vbs') -Destination $bundleRoot -Force
-$bundleScripts = Join-Path $bundleRoot 'scripts'
-if (-not (Test-Path -LiteralPath $bundleScripts -PathType Container)) {
-    New-Item -ItemType Directory -Path $bundleScripts | Out-Null
-}
-Copy-Item -LiteralPath (Join-Path $projectRoot 'scripts\python-task.ps1') -Destination $bundleScripts -Force
 
 if (Test-Path -LiteralPath $archivePath -PathType Leaf) {
     Remove-Item -LiteralPath $archivePath -Force
