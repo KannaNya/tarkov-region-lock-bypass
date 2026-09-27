@@ -13,7 +13,13 @@ import zlib
 
 import support  # noqa: F401
 
-from tarkov_cis.catalog import openvpn_tcp_ports, parse_vpngate_csv, rc4, read_native_catalog
+from tarkov_cis.catalog import (
+    openvpn_tcp_ports,
+    parse_native_catalog,
+    parse_vpngate_csv,
+    rc4,
+    read_native_catalog,
+)
 
 HEADER = [
     "#HostName", "IP", "Score", "Ping", "Speed", "CountryLong", "CountryShort", "NumVpnSessions",
@@ -125,6 +131,11 @@ class NativeCatalogTests(unittest.TestCase):
                     ["192.0.2.10:443", "192.0.2.10:992", "udp://192.0.2.10:2061"],
                 )
                 self.assertTrue(all(r.source == "NativeCatalog" and r.speed_mbps == 52.0 for r in relays))
+
+    def test_downloaded_bytes_parse_without_a_file(self):
+        data = native_file(self.NOW - timedelta(minutes=1), compressed=True)
+        relays = parse_native_catalog(data, max_age_hours=24, now=self.NOW)
+        self.assertEqual(len(relays), 3)
 
     def test_stale_catalog_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "stale"):

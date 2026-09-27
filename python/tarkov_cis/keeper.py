@@ -25,7 +25,7 @@ from typing import Callable, Protocol
 from .config import Config
 from .game import GameSnapshot
 from .models import Relay, VpnLease
-from .relays import FailureCooldown, order_candidates
+from .relays import FailureCooldown, KnownGood, order_candidates
 from .routes import RouteError, RouteManager
 from .softether import LocalBusyError, SoftEther, SoftEtherError
 
@@ -79,6 +79,7 @@ class Keeper:
         catalog: Callable[[], list[Relay]],
         targets: Callable[[], tuple[str, ...]],
         game: Callable[[], GameSnapshot],
+        known_good: KnownGood | None = None,
         log: Callable[[str], None] = lambda _message: None,
         publish: Callable[[Status], None] = lambda _status: None,
         clock: Callable[[], float] = time.monotonic,
@@ -89,6 +90,7 @@ class Keeper:
         self.catalog = catalog
         self.targets = targets
         self.game = game
+        self.known_good = known_good
         self.log = log
         self._publish = publish
         self.clock = clock
@@ -211,8 +213,13 @@ class Keeper:
         try:
             relays = self.catalog()
         except Exception as exc:
-            self._set(Phase.WAITING, f"节点目录读取失败: {exc}")
-            return self._backoff()
+            if self.known_good is None or not self.known_good.fresh():
+                self._set(Phase.WAITING, f"节点目录读取失败: {exc}")
+                return self._backoff()
+            self.log(f"[warning] 节点目录读取失败，只尝试近期成功节点: {exc}")
+            relays = []
+        if self.known_good is not None:
+            relays = self.known_good.merge(relays)
         candidates = order_candidates(
             self.cooldown.filter(relays),
             per_country=config.max_candidates_per_country,
@@ -252,6 +259,8 @@ class Keeper:
                 self.log(f"[switching] {relay.country} {relay.endpoint} 失败: {exc}")
                 continue
             self.cooldown.record_success(relay)
+            if self.known_good is not None:
+                self.known_good.remember(relay)
             self._relay = relay
             return self._maintain(lease)
 

@@ -19,8 +19,8 @@ keeper
 | 模块 | 职责 |
 | --- | --- |
 | `config.py` | 读取 `config.json`（保留原有 PascalCase 键；已废弃的键会被忽略）。 |
-| `catalog.py` | 解析 VPN Gate 官方 HTTPS 列表和 SoftEther 插件缓存 `VPNGate.dat`。 |
-| `relays.py` | 候选排序（CIS 国家轮询、优先不同 IP）和失败冷却。 |
+| `catalog.py` | 下载并解析 VPN Gate 官方 HTTPS 列表，以及插件所用接口提供的完整列表 `VPNGate.dat`。 |
+| `relays.py` | 候选排序（近期成功节点优先、CIS 国家轮询、优先不同 IP）、失败冷却和 48 小时成功节点缓存。 |
 | `targets.py` | 从配置和近期 EFT 日志发现 lobby/gw-pvp/WSN 主机名，并在一个总时限内并发解析。 |
 | `game.py` | 从 EFT 日志判断游戏阶段；日志尾部滚动或读取失败时不会解除已知的比赛保护。 |
 | `softether.py` | 通过 vpncmd 配置/连接/断开专用账户；只有 SID 与有效 IPv4 租约同时存在才算连上。 |
@@ -36,7 +36,7 @@ keeper
 1. **保护**：`PauseDuringRaid=true` 时，从匹配开始到结算结束，或者游戏在运行且节点已就绪，什么都不做，连只读的 vpncmd 查询也不发。
 2. **维护**：会话正常时重新解析鉴权地址并同步 `/32` 路由。DNS 暂时没有结果时保留现有路由。
 3. **容错**：已就绪的会话读不到时，先连续容忍 `SessionFailureThreshold` 次再切换。
-4. **切换**：撤销路由并断开，读取节点目录，按顺序尝试候选。失败的节点冷却 `FailureCooldownMinutes` 分钟；SoftEther 本机资源忙（退出码 43）不算节点失败。一轮最多运行 `FailoverTimeoutSeconds` 秒，失败后按 `FailedCycleRetrySeconds` 指数退避，上限 `FailedCycleBackoffMaxSeconds`。
+4. **切换**：撤销路由并断开，读取节点目录并合并近期成功节点（目录读取失败时只用近期成功节点），按顺序尝试候选。失败的节点冷却 `FailureCooldownMinutes` 分钟；SoftEther 本机资源忙（退出码 43）不算节点失败。一轮最多运行 `FailoverTimeoutSeconds` 秒，失败后按 `FailedCycleRetrySeconds` 指数退避，上限 `FailedCycleBackoffMaxSeconds`。
 
 每条会改变状态的命令之前都会重新检查游戏阶段；切换进行到一半时开始匹配，下一条命令之前就会中止，不做任何清理。
 

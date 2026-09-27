@@ -22,6 +22,7 @@
   "TcpProbeTimeoutMilliseconds": 1500,
   "DiscoveryTimeoutSeconds": 15,
   "FailureCooldownMinutes": 15,
+  "KnownGoodLifetimeHours": 48,
   "GameLogRoots": [
     "C:\\Games\\EscapeFromTarkov\\Logs"
   ],

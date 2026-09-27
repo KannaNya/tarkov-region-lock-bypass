@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 import threading
 import unittest
 
@@ -9,6 +11,7 @@ from tarkov_cis.config import Config
 from tarkov_cis.game import GameSnapshot, Phase as GamePhase
 from tarkov_cis.keeper import Keeper, Phase
 from tarkov_cis.models import VpnLease
+from tarkov_cis.relays import KnownGood
 from tarkov_cis.routes import RouteError
 from tarkov_cis.softether import LocalBusyError, SoftEtherError
 
@@ -83,6 +86,8 @@ class KeeperTests(unittest.TestCase):
         self.catalog_calls = 0
         self.config = Config()
         self.keeper = self.make()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
 
     def make(self, **config) -> Keeper:
         if config:
@@ -224,6 +229,28 @@ class KeeperTests(unittest.TestCase):
         self.assertEqual(self.routes.owned, ())
         self.assertIsNone(self.vpn.current)
         self.assertEqual(self.keeper.status.phase, Phase.STOPPED)
+
+    def test_connected_relay_is_remembered_and_used_when_the_catalog_fails(self):
+        known = KnownGood(Path(self.tmp.name) / "known-good.json", lifetime_hours=48)
+        keeper = Keeper(
+            self.config, vpn=self.vpn, routes=self.routes, catalog=lambda: self.relays,
+            targets=lambda: self.ips, game=lambda: self.game, known_good=known,
+        )
+        keeper.step()
+        self.assertEqual([r.endpoint for r in known.fresh()], ["192.0.2.1:443"])
+
+        def offline():
+            raise RuntimeError("offline")
+
+        self.vpn.current = None
+        restarted = Keeper(
+            self.config, vpn=self.vpn, routes=self.routes, catalog=offline,
+            targets=lambda: self.ips, game=lambda: self.game,
+            known_good=KnownGood(Path(self.tmp.name) / "known-good.json", lifetime_hours=48),
+        )
+        restarted.step()
+        self.assertEqual(restarted.status.phase, Phase.READY)
+        self.assertEqual(restarted.status.relay, "192.0.2.1:443")
 
     def test_run_loop_exits_on_stop_and_shuts_down(self):
         stop = threading.Event()

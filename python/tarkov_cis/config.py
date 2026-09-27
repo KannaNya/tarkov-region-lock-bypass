@@ -69,6 +69,8 @@ class Config:
     tcp_probe_timeout_milliseconds: int = 1500
     discovery_timeout_seconds: int = 15
     failure_cooldown_minutes: int = 15
+    # Relays that really connected are retried first for this long.
+    known_good_lifetime_hours: int = 48
     game_log_roots: tuple[str, ...] = ()
     target_hosts: tuple[str, ...] = DEFAULT_TARGET_HOSTS
 
@@ -94,10 +96,21 @@ class Config:
             return cls.from_mapping(json.load(handle))
 
     @property
-    def native_catalog(self) -> Path:
+    def native_catalog_files(self) -> tuple[Path, ...]:
+        """Where the SoftEther VPN Gate plug-in may have saved its list.
+
+        The plug-in writes next to the client binaries; without elevation
+        Windows redirects that write into the per-user VirtualStore.
+        """
+
         if self.native_catalog_path:
-            return Path(self.native_catalog_path)
-        return Path(self.vpncmd_path).parent / "VPNGate.dat"
+            return (Path(self.native_catalog_path),)
+        plugin_dir = Path(self.vpncmd_path).parent
+        files = [plugin_dir / "VPNGate.dat"]
+        local = os.environ.get("LOCALAPPDATA")
+        if local and plugin_dir.drive:
+            files.append(Path(local) / "VirtualStore" / plugin_dir.relative_to(plugin_dir.anchor) / "VPNGate.dat")
+        return tuple(files)
 
 
 def _pascal(name: str) -> str:

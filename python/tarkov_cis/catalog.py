@@ -19,6 +19,9 @@ import zlib
 from .models import COUNTRY_PRIORITY, Relay
 
 VPNGATE_API = "https://www.vpngate.net/api/iphone/"
+# The endpoint the SoftEther VPN Gate plug-in itself downloads VPNGate.dat
+# from; %c is a random letter used for load balancing.
+VPNGATE_NATIVE_API = "http://x{0}.x{0}.client.api.vpngate2.jp/api/"
 MAX_CATALOG_BYTES = 32 * 1024 * 1024
 CIS = frozenset(COUNTRY_PRIORITY)
 
@@ -138,20 +141,50 @@ def _int(value: object, default: int = 0) -> int:
         return default
 
 
-# --- SoftEther VPN Gate plug-in cache (VPNGate.dat) -------------------------
+# --- SoftEther VPN Gate native list (VPNGate.dat) ---------------------------
 #
-# The plug-in stores its relay list as an RC4-obfuscated SoftEther PACK with a
-# zlib-compressed inner PACK.  Only the presence of the 128-byte signature is
-# checked; SoftEther's public-key verification is not reproduced here.
+# The plug-in's list is far larger than the HTTPS CSV and includes UDP (NAT-T)
+# relays.  It is an RC4-obfuscated SoftEther PACK with a zlib-compressed inner
+# PACK.  Only the presence of the 128-byte signature is checked; SoftEther's
+# public-key verification is not reproduced here.  The relays themselves are
+# untrusted volunteers either way; game traffic inside the tunnel stays TLS.
+
+
+def download_native_catalog(timeout: float, cache: Path) -> bytes:
+    """Fetch VPNGate.dat like the plug-in does and keep a copy in *cache*."""
+
+    request = Request(
+        VPNGATE_NATIVE_API.format(secrets.choice("abcdefghijklmnopqrstuvwxyz")),
+        headers={"User-Agent": "Tarkov-CIS/0.3"},
+    )
+    with urlopen(request, timeout=timeout) as response:
+        data = response.read(MAX_CATALOG_BYTES + 1)
+    _check_native_envelope(data)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    temporary = cache.with_suffix(".tmp")
+    temporary.write_bytes(data)
+    temporary.replace(cache)
+    return data
 
 
 def read_native_catalog(path: Path, *, max_age_hours: int, now: datetime | None = None) -> tuple[Relay, ...]:
     data = path.read_bytes()
+    modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    return parse_native_catalog(data, max_age_hours=max_age_hours, now=now, fallback_time=modified)
+
+
+def _check_native_envelope(data: bytes) -> None:
     if not 0x104 < len(data) <= 16 * 1024 * 1024:
         raise ValueError("VPN Gate native catalog size is invalid")
     if not data[:32].decode("ascii", errors="ignore").startswith("[VPNGate Data File]"):
         raise ValueError("VPN Gate native catalog header is invalid")
-    age = (now or datetime.now(timezone.utc)) - _native_timestamp(data, path)
+
+
+def parse_native_catalog(
+    data: bytes, *, max_age_hours: int, now: datetime | None = None, fallback_time: datetime | None = None
+) -> tuple[Relay, ...]:
+    _check_native_envelope(data)
+    age = (now or datetime.now(timezone.utc)) - _native_timestamp(data, fallback_time)
     if age < timedelta(hours=-1):
         raise ValueError("VPN Gate native catalog timestamp is in the future")
     if max_age_hours > 0 and age > timedelta(hours=max_age_hours):
@@ -220,11 +253,13 @@ def rc4(data: bytes, key: bytes) -> bytes:
     return bytes(out)
 
 
-def _native_timestamp(data: bytes, path: Path) -> datetime:
+def _native_timestamp(data: bytes, fallback: datetime | None) -> datetime:
     match = re.search(r"(?m)^(\d{8}_\d{6}\.\d{3})\r?$", data[:240].decode("ascii", errors="ignore"))
     if match:
         return datetime.strptime(match.group(1), "%Y%m%d_%H%M%S.%f").replace(tzinfo=timezone.utc)
-    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    if fallback is None:
+        raise ValueError("VPN Gate native catalog has no timestamp")
+    return fallback
 
 
 def _inflate(payload: bytes) -> bytes:

@@ -23,7 +23,7 @@ from .game import GameProbe
 from .keeper import Keeper, Status
 from .logfile import RotatingLog, tail
 from .models import Relay
-from .relays import order_candidates
+from .relays import KnownGood, order_candidates
 from .routes import RouteManager
 from .softether import SoftEther
 from .targets import authorization_ips, log_roots
@@ -33,7 +33,7 @@ from .winapi.schtasks import TaskAction, TaskScheduler
 KEEPER_MUTEX = r"Local\TarkovCIS-Keeper"
 STOP_EVENT = r"Local\TarkovCIS-Stop"
 # Files the pre-refactor keeper left behind; removed on install.
-LEGACY_STATE_FILES = ("keeper.pid.json", "stop.request.json", "keeper-status.json", "failures.json", "known-good.json")
+LEGACY_STATE_FILES = ("keeper.pid.json", "stop.request.json", "keeper-status.json", "failures.json")
 
 
 def status_path() -> Path:
@@ -60,26 +60,54 @@ def make_vpn(config: Config) -> SoftEther:
     )
 
 
+def native_cache_path() -> Path:
+    return state_dir() / "VPNGate.dat"
+
+
+def known_good_path() -> Path:
+    return state_dir() / "known-good.json"
+
+
+def _native_relays(config: Config) -> list[Relay]:
+    """The full VPN Gate list: download it, else fall back to the newest local copy."""
+
+    try:
+        data = catalogs.download_native_catalog(config.discovery_timeout_seconds, native_cache_path())
+        return list(catalogs.parse_native_catalog(data, max_age_hours=config.native_catalog_max_age_hours))
+    except Exception as download_error:
+        error: Exception = download_error
+    for path in (native_cache_path(), *config.native_catalog_files):
+        try:
+            return list(catalogs.read_native_catalog(path, max_age_hours=config.native_catalog_max_age_hours))
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            error = exc
+    raise error
+
+
 def load_catalog(config: Config, log=lambda _message: None) -> list[Relay]:
     """Both live catalogs; one failing is fine, both failing is an error."""
 
     relays: list[Relay] = []
     errors: list[str] = []
-    try:
-        relays.extend(catalogs.download_https_catalog(config.discovery_timeout_seconds))
-    except Exception as exc:
-        errors.append(f"HTTPS: {exc}")
-    try:
-        relays.extend(catalogs.read_native_catalog(config.native_catalog, max_age_hours=config.native_catalog_max_age_hours))
-    except FileNotFoundError:
-        pass
-    except Exception as exc:
-        errors.append(f"VPNGate.dat: {exc}")
+    for name, source in (
+        ("VPNGate.dat", lambda: _native_relays(config)),
+        ("HTTPS", lambda: catalogs.download_https_catalog(config.discovery_timeout_seconds)),
+    ):
+        try:
+            relays.extend(source())
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
     for error in errors:
         log(f"[warning] 节点目录 {error}")
     if not relays and errors:
         raise RuntimeError("; ".join(errors))
     return relays
+
+
+def make_known_good(config: Config) -> KnownGood:
+    return KnownGood(known_good_path(), lifetime_hours=config.known_good_lifetime_hours)
 
 
 def build_keeper(config: Config, *, log, publish) -> Keeper:
@@ -95,6 +123,7 @@ def build_keeper(config: Config, *, log, publish) -> Keeper:
             max_files=config.game_phase_max_files,
             max_bytes_per_file=config.game_phase_max_bytes_per_file,
         ),
+        known_good=make_known_good(config),
         log=log,
         publish=publish,
     )
@@ -260,7 +289,7 @@ def candidates(config_path: Path) -> list[Relay]:
     config = load_readonly(config_path)
     return list(
         order_candidates(
-            load_catalog(config),
+            make_known_good(config).merge(load_catalog(config)),
             per_country=config.max_candidates_per_country,
             total=config.max_candidates_total,
         )
