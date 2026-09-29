@@ -3,31 +3,25 @@
   "VpnInterfaceAlias": "VPN - VPN Client",
   "AccountName": "Tarkov-CIS-PlayOnly",
   "VpnCmdPath": "C:\\Program Files\\SoftEther VPN Client\\vpncmd_x64.exe",
+  "NicName": "VPN",
   "NativeCatalogPath": "",
   "NativeCatalogMaxAgeHours": 24,
-  "NicName": "VPN",
   "RefreshSeconds": 30,
   "FailedCycleRetrySeconds": 10,
-  "DisconnectedPollSeconds": 5,
-  "HealthFailureThreshold": 3,
-  "SessionFailureThreshold": 3,
   "FailedCycleBackoffMaxSeconds": 10,
+  "SessionFailureThreshold": 3,
   "PauseDuringRaid": true,
-  "DisconnectAtRaid": false,
   "GamePhaseMaxAgeDays": 2,
   "GamePhaseMaxFiles": 24,
   "GamePhaseMaxBytesPerFile": 262144,
   "ConnectTimeoutSeconds": 18,
   "DisconnectWaitSeconds": 15,
-  "ResourceBusyRetryCount": 2,
   "FailoverTimeoutSeconds": 180,
   "MaxCandidatesPerCountry": 10,
   "MaxCandidatesTotal": 20,
   "TcpProbeTimeoutMilliseconds": 1500,
   "DiscoveryTimeoutSeconds": 15,
   "FailureCooldownMinutes": 15,
-  "CoolingFallbackMinutes": 0,
-  "CoolingFallbackCandidates": 3,
   "KnownGoodLifetimeHours": 48,
   "GameLogRoots": [
     "C:\\Games\\EscapeFromTarkov\\Logs"
@@ -39,6 +33,5 @@
     "lobby.escapefromtarkov.ru",
     "wsn-pvp-season-01.escapefromtarkov.com",
     "wsn-pvp-season-02.escapefromtarkov.com"
-  ],
-  "RaidTargets": []
+  ]
 }

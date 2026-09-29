@@ -1,30 +1,25 @@
-"""SoftEther VPN Client adapter for the Python keeper."""
+"""SoftEther VPN Client control through vpncmd, lease checks through iphlpapi."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import ipaddress
-import json
 from pathlib import Path
 import re
 import socket
 import tempfile
 import time
-from typing import Any, Callable
+from typing import Callable
 
-from .process_runner import CommandResult, run_command
+from .models import Relay, VpnLease
+from .process import CommandResult, Runner, run
 
-
-DEFAULT_VPNCMD = Path(r"C:\Program Files\SoftEther VPN Client\vpncmd_x64.exe")
 SESSION_ID_RE = re.compile(r"\bSID-[A-Za-z0-9-]+\b", re.IGNORECASE)
+LOCAL_BUSY_EXIT_CODE = 43
+Guard = Callable[[], None]
 
 
-@dataclass(frozen=True, slots=True)
-class VpnLease:
-    interface_index: int
-    interface_alias: str
-    ipv4: str
-    gateway: str
+def _no_guard() -> None:
+    return None
 
 
 class SoftEtherError(RuntimeError):
@@ -33,325 +28,191 @@ class SoftEtherError(RuntimeError):
         self.result = result
 
 
-class LocalResourceBusyError(SoftEtherError):
-    """SoftEther exit code 43: local session resources are still busy."""
+class LocalBusyError(SoftEtherError):
+    """vpncmd exit code 43: local client resources are busy, not a relay fault."""
 
 
-Runner = Callable[..., CommandResult]
+class SoftEther:
+    """One dedicated SoftEther account, re-pointed at each relay we try.
 
-
-def _powershell_quote(value: str) -> str:
-    """Quote a literal embedded in a PowerShell single-quoted string."""
-
-    return "'" + value.replace("'", "''") + "'"
-
-
-class SoftEtherClient:
-    """Configure one SoftEther account and verify its real Windows lease.
-
-    ``AccountConnect`` returning zero is intentionally not considered success.
-    A usable connection must expose both a locale-independent SoftEther session
-    ID and an up adapter with a non-APIPA IPv4 address and gateway.
+    AccountConnect returning 0 is not success: a relay is only usable once
+    the client reports a session ID *and* the virtual adapter has a real IPv4
+    address with a gateway.
     """
 
     def __init__(
         self,
         *,
-        vpncmd_path: str | Path = DEFAULT_VPNCMD,
-        account_name: str = "Tarkov-CIS-PlayOnly",
-        interface_alias: str = "VPN - VPN Client",
-        nic_name: str = "VPN",
-        powershell: str = "powershell.exe",
-        runner: Runner = run_command,
+        vpncmd_path: str,
+        account_name: str,
+        interface_alias: str,
+        nic_name: str,
+        runner: Runner = run,
+        net=None,
         command_timeout: float = 15.0,
-        operation_guard: Callable[[], None] | None = None,
     ) -> None:
-        self.vpncmd_path = Path(vpncmd_path)
+        self.vpncmd_path = vpncmd_path
         self.account_name = account_name
         self.interface_alias = interface_alias
         self.nic_name = nic_name
-        self.powershell = powershell
         self._run = runner
+        self._net = net
         self.command_timeout = command_timeout
-        self.operation_guard = operation_guard
 
-    def _check_operation(self) -> None:
-        if self.operation_guard is not None:
-            self.operation_guard()
+    @property
+    def net(self):
+        if self._net is None:
+            from .winapi import iphlpapi
 
-    def _vpncmd(self, *arguments: str, timeout: float | None = None) -> CommandResult:
-        self._check_operation()
+            self._net = iphlpapi
+        return self._net
+
+    # --- read-only checks ---------------------------------------------------
+
+    def adapter_lease(self) -> VpnLease | None:
+        """The adapter's non-APIPA IPv4 and its DHCP gateway, if both exist."""
+
+        index = self.net.interface_index(self.interface_alias)
+        if index is None:
+            return None
+        address = next(
+            (ip for ip in self.net.preferred_ipv4_addresses(index) if not ipaddress.IPv4Address(ip).is_link_local),
+            None,
+        )
+        gateway = next(
+            (
+                route.next_hop
+                for route in self.net.ipv4_routes()
+                if route.interface_index == index and route.prefix_length == 0 and route.next_hop != "0.0.0.0"
+            ),
+            None,
+        )
+        if address is None or gateway is None:
+            return None
+        return VpnLease(interface_index=index, ipv4=address, gateway=gateway)
+
+    def session_established(self) -> bool:
         result = self._run(
-            [
-                str(self.vpncmd_path),
-                "/CLIENT",
-                "localhost",
-                "/CMD",
-                *arguments,
-            ],
-            timeout=timeout or self.command_timeout,
-            check=False,
+            [self.vpncmd_path, "/CSV", "/CLIENT", "localhost", "/CMD", "AccountStatusGet", self.account_name],
+            timeout=self.command_timeout,
         )
-        if not result.ok:
-            operation = arguments[0] if arguments else "vpncmd"
-            detail = result.stderr.strip() or result.stdout.strip()
-            suffix = f": {detail}" if detail else ""
-            error_type = LocalResourceBusyError if result.exit_code == 43 else SoftEtherError
-            raise error_type(f"{operation} failed with exit code {result.exit_code}{suffix}", result)
-        return result
+        return result.ok and SESSION_ID_RE.search(result.stdout + result.stderr) is not None
 
-    def account_status(self, *, timeout: float | None = None) -> CommandResult:
-        # /CSV improves stability of the machine-readable fields, while the
-        # SID check remains independent of the installed UI language.
-        self._check_operation()
-        return self._run(
-            [
-                str(self.vpncmd_path),
-                "/CSV",
-                "/CLIENT",
-                "localhost",
-                "/CMD",
-                "AccountStatusGet",
-                self.account_name,
-            ],
-            timeout=timeout or self.command_timeout,
-            check=False,
-        )
-
-    def has_established_session(self, *, timeout: float | None = None) -> bool:
-        result = self.account_status(timeout=timeout)
-        if not result.ok:
-            return False
-        return SESSION_ID_RE.search(result.stdout + "\n" + result.stderr) is not None
-
-    def get_lease(self, *, timeout: float | None = None) -> VpnLease | None:
-        self._check_operation()
-        alias = _powershell_quote(self.interface_alias)
-        script = (
-            "$ErrorActionPreference='Stop';"
-            f"$a=Get-NetAdapter -InterfaceAlias {alias} -ErrorAction Stop;"
-            "if($a.Status -ne 'Up'){exit 3};"
-            "$c=Get-NetIPConfiguration -InterfaceIndex $a.ifIndex -ErrorAction Stop;"
-            "$ip=@($c.IPv4Address|Where-Object {"
-            "$_.IPAddress -and $_.IPAddress -notlike '169.254.*' -and "
-            "$_.IPAddress -ne '0.0.0.0'}|Select-Object -ExpandProperty IPAddress -First 1);"
-            "$gw=@($c.IPv4DefaultGateway|Where-Object NextHop|"
-            "Select-Object -ExpandProperty NextHop -First 1);"
-            "if(-not $ip -or -not $gw){exit 4};"
-            "[pscustomobject]@{InterfaceIndex=[int]$a.ifIndex;"
-            "InterfaceAlias=[string]$a.InterfaceAlias;IPv4=[string]$ip;"
-            "Gateway=[string]$gw}|ConvertTo-Json -Compress"
-        )
-        result = self._run(
-            [self.powershell, "-NoProfile", "-NonInteractive", "-Command", script],
-            timeout=timeout or self.command_timeout,
-            check=False,
-        )
-        if not result.ok or not result.stdout.strip():
+    def lease(self) -> VpnLease | None:
+        lease = self.adapter_lease()
+        if lease is None or not self.session_established():
             return None
+        return lease
+
+    @staticmethod
+    def probe_tcp(relay: Relay, *, timeout: float) -> bool:
         try:
-            raw = json.loads(result.stdout.strip())
-            if isinstance(raw, list):
-                raw = raw[0]
-            ipv4 = ipaddress.IPv4Address(str(raw["IPv4"]))
-            gateway = ipaddress.IPv4Address(str(raw["Gateway"]))
-            if ipv4.is_link_local or ipv4.is_unspecified or gateway.is_unspecified:
-                return None
-            return VpnLease(
-                interface_index=int(raw["InterfaceIndex"]),
-                interface_alias=str(raw["InterfaceAlias"]),
-                ipv4=str(ipv4),
-                gateway=str(gateway),
-            )
-        except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return None
-
-    def verified_connection(self, *, timeout: float | None = None) -> VpnLease | None:
-        if not self.has_established_session(timeout=timeout):
-            return None
-        return self.get_lease(timeout=timeout)
-
-    def probe_tcp(self, relay: Any, *, timeout: float = 1.5) -> bool:
-        self._check_operation()
-        host = str(getattr(relay, "ip", "") or getattr(relay, "host_name", ""))
-        port = int(getattr(relay, "port", 0))
-        if not host or not 1 <= port <= 65535:
-            return False
-        try:
-            with socket.create_connection((host, port), timeout=timeout):
+            with socket.create_connection((relay.ip, relay.port), timeout=timeout):
                 return True
         except OSError:
             return False
 
-    def _account_exists(self, *, timeout: float | None = None) -> bool:
-        result = self._vpncmd("AccountList", timeout=timeout)
-        return re.search(
-            rf"(?im)(?:^|[|\s]){re.escape(self.account_name)}(?:$|[|\s])",
-            result.stdout,
-        ) is not None
+    # --- state-changing operations -----------------------------------------
 
-    def ensure_account(self, relay: Any, *, deadline: float | None = None) -> None:
-        host = str(getattr(relay, "ip", "") or getattr(relay, "host_name", ""))
-        port = int(getattr(relay, "port", 0))
-        transport = str(getattr(relay, "transport", "tcp"))
-        if not host or not 1 <= port <= 65535:
-            raise ValueError("relay must provide a host/IP and valid port")
-        if transport not in {"tcp", "udp"}:
-            raise ValueError("unsupported SoftEther transport")
-        server = f"/SERVER:{host}:{port if transport == 'tcp' else 0}"
-        def remaining() -> float:
-            if deadline is None:
-                return self.command_timeout
-            value = deadline - time.monotonic()
-            if value <= 0:
-                raise SoftEtherError("failover deadline expired during account configuration")
-            return min(self.command_timeout, value)
-
-        account_exists = self._account_exists(timeout=remaining())
-        if account_exists and transport == "tcp":
-            self._vpncmd(
-                "AccountSet", self.account_name, server, "/HUB:VPNGATE", timeout=remaining()
-            )
-        elif not account_exists:
-            self._vpncmd(
-                "AccountCreate",
-                self.account_name,
-                server,
-                "/HUB:VPNGATE",
-                "/USERNAME:vpn",
-                f"/NICNAME:{self.nic_name}",
-                timeout=remaining(),
-            )
-            self._vpncmd(
-                "AccountPasswordSet",
-                self.account_name,
-                "/PASSWORD:vpn",
-                "/TYPE:standard",
-                timeout=remaining(),
-            )
-        # vpncmd has no switch for NAT-T. SoftEther's own exported connection
-        # setting exposes PortUDP; importing the edited setting is supported by
-        # the client and was verified against the installed Windows client.
-        # Also clear a prior UDP port when rotating back to TCP: AccountSet
-        # changes only Port and would otherwise keep using the old UDP relay.
-        if transport == "udp" or account_exists:
-            with tempfile.TemporaryDirectory(prefix="tarkov-cis-vpn-") as directory:
-                original = Path(directory) / "original.vpn"
-                updated = Path(directory) / "updated.vpn"
-                self._vpncmd(
-                    "AccountExport", self.account_name,
-                    f"/SAVEPATH:{original}", timeout=remaining(),
-                )
-                source = original.read_text(encoding="utf-8-sig")
-                match = re.search(r"(?m)^(\s*uint PortUDP )\d+\s*$", source)
-                if match is None:
-                    raise SoftEtherError("exported SoftEther account has no PortUDP field")
-                desired_udp = port if transport == "udp" else 0
-                changed = source
-                replacements = {"PortUDP": desired_udp}
-                if transport == "udp":
-                    replacements.update({"Hostname": host, "Port": 0})
-                for field, value in replacements.items():
-                    kind = "string" if field == "Hostname" else "uint"
-                    changed, count = re.subn(
-                        rf"(?m)^(\s*{kind} {field} )\S+",
-                        lambda item: item.group(1) + str(value),
-                        changed,
-                        count=1,
-                    )
-                    if count != 1:
-                        raise SoftEtherError(f"exported SoftEther account has no {field} field")
-                if changed != source:
-                    updated.write_text(changed, encoding="utf-8")
-                    self._vpncmd("AccountDelete", self.account_name, timeout=remaining())
-                    try:
-                        self._vpncmd("AccountImport", str(updated), timeout=remaining())
-                    except Exception:
-                        self._vpncmd("AccountImport", str(original), timeout=remaining())
-                        raise
-        # The Python keeper owns relay rotation; disable SoftEther's unbounded
-        # internal endpoint retries.
-        self._vpncmd(
-            "AccountRetrySet",
-            self.account_name,
-            "/NUM:0",
-            "/INTERVAL:5",
-            timeout=remaining(),
-        )
-        self._vpncmd("AccountStatusHide", self.account_name, timeout=remaining())
-
-    def disconnect(self, *, timeout: float = 15.0, poll_interval: float = 0.25) -> bool:
-        self._check_operation()
-        deadline = time.monotonic() + max(timeout, 0.1)
+    def _vpncmd(self, *arguments: str, guard: Guard = _no_guard, timeout: float | None = None) -> CommandResult:
+        guard()
         result = self._run(
-            [
-                str(self.vpncmd_path),
-                "/CLIENT",
-                "localhost",
-                "/CMD",
-                "AccountDisconnect",
-                self.account_name,
-            ],
-            timeout=min(self.command_timeout, max(deadline - time.monotonic(), 0.1)),
-            check=False,
+            [self.vpncmd_path, "/CLIENT", "localhost", "/CMD", *arguments],
+            timeout=min(self.command_timeout, timeout) if timeout else self.command_timeout,
         )
-        while time.monotonic() <= deadline:
-            remaining = max(0.1, deadline - time.monotonic())
-            if not self.has_established_session(
-                timeout=min(self.command_timeout, remaining)
-            ) and self.get_lease(timeout=min(self.command_timeout, remaining)) is None:
-                return True
-            time.sleep(max(0.01, poll_interval))
         if not result.ok:
-            error_type = (
-                LocalResourceBusyError if result.exit_code == 43 else SoftEtherError
-            )
-            raise error_type(
-                f"AccountDisconnect failed with exit code {result.exit_code}", result
-            )
+            kind = LocalBusyError if result.exit_code == LOCAL_BUSY_EXIT_CODE else SoftEtherError
+            suffix = f": {result.detail()}" if result.detail() else ""
+            raise kind(f"{arguments[0]} 失败（退出码 {result.exit_code}）{suffix}", result)
+        return result
+
+    def disconnect(self, *, timeout: float, guard: Guard = _no_guard) -> bool:
+        """Disconnect and wait until both the session and the lease are gone."""
+
+        deadline = time.monotonic() + timeout
+        guard()
+        # "Not connected" also exits non-zero; the polling below is the truth.
+        self._run(
+            [self.vpncmd_path, "/CLIENT", "localhost", "/CMD", "AccountDisconnect", self.account_name],
+            timeout=min(self.command_timeout, timeout),
+        )
+        while time.monotonic() < deadline:
+            if self.adapter_lease() is None and not self.session_established():
+                return True
+            time.sleep(0.25)
         return False
 
-    def connect(
-        self,
-        relay: Any,
-        *,
-        timeout: float = 18.0,
-        poll_interval: float = 0.5,
-    ) -> VpnLease:
-        # Failure to observe a prior session is acceptable; a stale adapter is
-        # not.  The bounded disconnect prevents reconfiguration while the local
-        # SoftEther resources are still busy.
-        deadline = time.monotonic() + max(timeout, 0.1)
+    def connect(self, relay: Relay, *, timeout: float, guard: Guard = _no_guard) -> VpnLease:
+        deadline = time.monotonic() + timeout
 
         def remaining() -> float:
-            value = deadline - time.monotonic()
-            if value <= 0:
-                raise SoftEtherError("failover deadline expired")
-            return value
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise SoftEtherError("连接超时")
+            return left
 
-        if not self.disconnect(
-            timeout=min(remaining(), 15.0), poll_interval=poll_interval
-        ):
-            raise SoftEtherError("previous SoftEther session did not release")
-        self.ensure_account(relay, deadline=deadline)
-        self._vpncmd(
-            "AccountConnect",
-            self.account_name,
-            timeout=min(self.command_timeout, remaining()),
-        )
-
-        while time.monotonic() <= deadline:
-            lease = self.verified_connection(
-                timeout=min(self.command_timeout, max(0.1, remaining()))
-            )
+        if not self.disconnect(timeout=min(remaining(), 15.0), guard=guard):
+            raise LocalBusyError("上一个 SoftEther 会话没有释放")
+        self._configure_account(relay, guard=guard, remaining=remaining)
+        self._vpncmd("AccountConnect", self.account_name, guard=guard, timeout=remaining())
+        while time.monotonic() < deadline:
+            lease = self.lease()
             if lease is not None:
                 return lease
-            time.sleep(max(0.01, poll_interval))
+            time.sleep(0.5)
+        self.disconnect(timeout=5.0, guard=guard)
+        raise SoftEtherError("握手后没有同时得到 SoftEther 会话和有效 IPv4 租约")
 
-        try:
-            self.disconnect(timeout=min(timeout, 5.0), poll_interval=poll_interval)
-        except SoftEtherError:
-            pass
-        raise SoftEtherError(
-            "SoftEther handshake did not produce both an established session and a non-APIPA IPv4 lease"
-        )
+    def _account_exists(self, *, guard: Guard, remaining: Callable[[], float]) -> bool:
+        listing = self._vpncmd("AccountList", guard=guard, timeout=remaining()).stdout
+        return re.search(rf"(?im)(?:^|[|\s]){re.escape(self.account_name)}(?:$|[|\s])", listing) is not None
+
+    def _configure_account(self, relay: Relay, *, guard: Guard, remaining: Callable[[], float]) -> None:
+        exists = self._account_exists(guard=guard, remaining=remaining)
+        # A UDP (NAT-T) relay is addressed with TCP port 0 plus PortUDP.
+        server = f"/SERVER:{relay.ip}:{relay.port if relay.transport == 'tcp' else 0}"
+        if not exists:
+            self._vpncmd(
+                "AccountCreate", self.account_name, server, "/HUB:VPNGATE", "/USERNAME:vpn",
+                f"/NICNAME:{self.nic_name}", guard=guard, timeout=remaining(),
+            )
+            self._vpncmd(
+                "AccountPasswordSet", self.account_name, "/PASSWORD:vpn", "/TYPE:standard",
+                guard=guard, timeout=remaining(),
+            )
+        elif relay.transport == "tcp":
+            self._vpncmd("AccountSet", self.account_name, server, "/HUB:VPNGATE", guard=guard, timeout=remaining())
+        if relay.transport == "udp" or exists:
+            # vpncmd has no NAT-T switch, but an exported account exposes
+            # PortUDP.  Also reset it to 0 when rotating back to TCP, since
+            # AccountSet alone would keep dialling the old UDP relay.
+            self._set_udp_port(relay, guard=guard, remaining=remaining)
+        # The keeper owns relay rotation; SoftEther must not retry forever.
+        self._vpncmd("AccountRetrySet", self.account_name, "/NUM:0", "/INTERVAL:5", guard=guard, timeout=remaining())
+        self._vpncmd("AccountStatusHide", self.account_name, guard=guard, timeout=remaining())
+
+    def _set_udp_port(self, relay: Relay, *, guard: Guard, remaining: Callable[[], float]) -> None:
+        with tempfile.TemporaryDirectory(prefix="tarkov-cis-vpn-") as directory:
+            original = Path(directory) / "original.vpn"
+            updated = Path(directory) / "updated.vpn"
+            self._vpncmd("AccountExport", self.account_name, f"/SAVEPATH:{original}", guard=guard, timeout=remaining())
+            source = original.read_text(encoding="utf-8-sig")
+            fields: dict[str, tuple[str, object]] = {"PortUDP": ("uint", relay.port if relay.transport == "udp" else 0)}
+            if relay.transport == "udp":
+                fields.update({"Hostname": ("string", relay.ip), "Port": ("uint", 0)})
+            changed = source
+            for name, (kind, value) in fields.items():
+                changed, count = re.subn(
+                    rf"(?m)^(\s*{kind} {name} )\S+", lambda match: f"{match.group(1)}{value}", changed, count=1
+                )
+                if count != 1:
+                    raise SoftEtherError(f"导出的 SoftEther 账户缺少 {name} 字段")
+            if changed == source:
+                return
+            updated.write_text(changed, encoding="utf-8")
+            self._vpncmd("AccountDelete", self.account_name, guard=guard, timeout=remaining())
+            try:
+                self._vpncmd("AccountImport", str(updated), guard=guard, timeout=remaining())
+            except Exception:
+                self._vpncmd("AccountImport", str(original), timeout=self.command_timeout)
+                raise

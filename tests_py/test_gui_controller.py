@@ -107,13 +107,30 @@ class GuiControllerTests(unittest.TestCase):
 class GuiSurfaceContractTests(unittest.TestCase):
     def test_status_shows_current_connection_attempt(self):
         status = _format_status({
-            "task_state": "Running",
-            "connection_phase": "connecting",
+            "task_installed": True,
+            "keeper_running": True,
+            "phase": "connecting",
             "detail": "正在连接候选 2/3: RU 192.0.2.10:443",
-            "vpn_verified": False,
+            "vpn_ipv4": "",
+            "route_count": 0,
         })
+        self.assertIn("后台运行中", status)
         self.assertIn("正在连接候选 2/3", status)
         self.assertIn("VPN 未连接", status)
+
+    def test_status_shows_relay_and_routes_when_ready(self):
+        status = _format_status({
+            "task_installed": True,
+            "keeper_running": True,
+            "detail": "CIS 会话和鉴权路由已就绪",
+            "relay": "192.0.2.10:443",
+            "country": "RU",
+            "vpn_ipv4": "10.211.1.2",
+            "route_count": 4,
+        })
+        self.assertIn("节点 RU 192.0.2.10:443", status)
+        self.assertIn("VPN 10.211.1.2", status)
+        self.assertIn("鉴权路由 4 条", status)
 
     def test_close_only_destroys_window_and_never_calls_task_callbacks(self):
         calls = []
